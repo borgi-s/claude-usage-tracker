@@ -274,14 +274,9 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Plan caps (cost-weighted tokens)")
-    eff_pro_5h, eff_pro_week, caps_source = caps_mod.effective_caps()
-    st.caption(f"Source: {caps_source}")
-    pro_5h_raw = st.number_input("Pro 5h cap", value=int(eff_pro_5h), step=1_000_000)
-    pro_week_raw = st.number_input("Pro weekly cap", value=int(eff_pro_week), step=10_000_000)
+    st.subheader("Plan caps")
+    st.caption("Calibrated against output tokens — Anthropic's actual rate-limit signal.")
     show_max5x = st.checkbox("Show Max 5x line too", value=True)
-    pro_5h = pro_5h_raw
-    pro_week = pro_week_raw
 
     st.divider()
     st.subheader("Session table filter")
@@ -319,21 +314,22 @@ effective_5h_hours, n_observed_resets = metrics.effective_window_hours(
     calib_log_global, df, default=config.FIVE_HOUR_WINDOW_HOURS, min_samples=5,
 )
 
-max5x_5h_fallback = float(pro_5h_raw) * 5
-max5x_week_fallback = float(pro_week_raw) * 5
+# Caps are calibrated against output tokens (Anthropic's actual metering signal).
+# Fallback uses a rough heuristic: Max 5x output cap ≈ 2.1M tokens/5h, weekly ≈ 100M.
+OUTPUT_CAP_5H_FALLBACK = 2_100_000.0
+OUTPUT_CAP_WEEKLY_FALLBACK = 100_000_000.0
 global_cap_5h, n_anchor_5h = caps_mod.global_cap_from_anchors(
     calib_log_global, df, "5h", gap_hours=effective_5h_hours,
 )
 global_cap_week, n_anchor_week = caps_mod.global_cap_from_anchors(
     calib_log_global, df, "weekly", gap_hours=24 * 7,
 )
-effective_cap_5h = global_cap_5h if global_cap_5h else max5x_5h_fallback
-effective_cap_week = global_cap_week if global_cap_week else max5x_week_fallback
+effective_cap_5h = global_cap_5h if global_cap_5h else OUTPUT_CAP_5H_FALLBACK
+effective_cap_week = global_cap_week if global_cap_week else OUTPUT_CAP_WEEKLY_FALLBACK
 
-# Share columns: each row's contribution to the cumulative % of cap
 fdf_with_caps = fdf.with_columns(
-    (pl.col("cost_weighted_tokens") / effective_cap_5h).alias("share_5h"),
-    (pl.col("cost_weighted_tokens") / effective_cap_week).alias("share_week"),
+    (pl.col("output_tokens") / effective_cap_5h).alias("share_5h"),
+    (pl.col("output_tokens") / effective_cap_week).alias("share_week"),
 )
 
 

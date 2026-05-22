@@ -82,12 +82,12 @@ def render_5h_chart(
         else f"default 4.5h (need 5 reset observations to calibrate, have {n_observed_resets})"
     )
     cap_label = (
-        f"calibrated from {n_anchor_5h} 100%-anchor(s), cap = {effective_cap_5h/1e6:.1f}M cost-weighted"
-        if n_anchor_5h > 0 else f"no anchors yet — using sidebar fallback {effective_cap_5h/1e6:.1f}M"
+        f"calibrated from {n_anchor_5h} 100%-anchor(s), cap = {effective_cap_5h/1e6:.2f}M output tokens"
+        if n_anchor_5h > 0 else f"no anchors yet — using fallback {effective_cap_5h/1e6:.2f}M output tokens"
     )
-    st.subheader(f"5-hour burn (% of Max 5x cap, fixed window — {window_label}, {calib_source})")
-    st.caption(f"Y-axis: cumulative burn share of cap (cap = median of burn at 100% anchor moments). "
-               f"{cap_label}. Cumulative within each window is monotonically non-decreasing.")
+    st.subheader(f"5-hour output-token burn (% of Max 5x cap, fixed window — {window_label}, {calib_source})")
+    st.caption(f"Y-axis: cumulative output tokens / cap. Cap = median across 100% anchor moments of "
+               f"(output_tokens_in_window / util). {cap_label}.")
 
     y5_main = (five_h["cumulative_main"] * 100).to_list()
     y5_sub = (five_h["cumulative_sub"] * 100).to_list()
@@ -128,9 +128,9 @@ def render_weekly_chart(
         f"calibrated from {n_anchor_week} weekly 100%-anchor(s)" if n_anchor_week > 0
         else f"no weekly anchors yet — using fallback {effective_cap_week/1e6:.0f}M"
     )
-    st.subheader(f"Weekly burn (% of Max 5x cap, resets {reset_label})")
-    st.caption(f"Sum of per-message share-of-cap, cap = {effective_cap_week/1e6:.0f}M ({cap_label_w}). "
-               "Monotonically non-decreasing. Sawtooth drops to 0 at each reset.")
+    st.subheader(f"Weekly output-token burn (% of Max 5x cap, resets {reset_label})")
+    st.caption(f"Sum of per-message output-token share-of-cap, cap = {effective_cap_week/1e6:.0f}M output "
+               f"tokens ({cap_label_w}). Monotonically non-decreasing. Sawtooth drops to 0 at each reset.")
 
     y7_main = (weekly["cumulative_main"] * 100).to_list()
     y7_sub = (weekly["cumulative_sub"] * 100).to_list()

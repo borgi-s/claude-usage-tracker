@@ -361,20 +361,26 @@ def global_cap_from_anchors(
     kind: str,
     gap_hours: float,
     min_util: float = 0.95,
+    value_col: str = "output_tokens",
 ) -> tuple[Optional[float], int]:
     """Median cap such that the chart's window-cumulative at 100% anchor moments = 100%.
 
     For each ≥min_util anchor:
       - find the chart-detected window containing the anchor's timestamp
         (gap-based, same logic as five_hour_burn_since_reset)
-      - compute total burn in that window up to (and including) the anchor moment
+      - compute total burn in that window up to (and including) the anchor moment,
+        summing the column ``value_col``
       - implied_cap = burn_at_anchor / util_at_anchor
     Return (median_cap, n_anchors).
 
-    Uses chart-window burn (not Anthropic's resets_5h_iso burn) so the cap
-    matches what the chart's cumulative will actually display.
+    Default ``value_col="output_tokens"`` because Anthropic's 5h cap is metered on
+    output (verified empirically: two 100% anchors at the same output volume but
+    very different cost-weighted volumes due to model mix). Pass a different
+    column if you want to calibrate against a different aggregate.
     """
     if log.is_empty() or cache_df.is_empty():
+        return None, 0
+    if value_col not in cache_df.columns:
         return None, 0
     util_col = "util_5h" if kind == "5h" else "util_7d"
     if util_col not in log.columns:
@@ -385,10 +391,9 @@ def global_cap_from_anchors(
     if anchors.is_empty():
         return None, 0
 
-    # For 5h, do chart-window detection per anchor. For weekly, use Sun-07:00 reset.
     cache_sorted = cache_df.sort("ts")
     ts_list = cache_sorted["ts"].to_list()
-    cw_list = cache_sorted["cost_weighted_tokens"].to_list()
+    val_list = cache_sorted[value_col].to_list()
     gap = timedelta(hours=gap_hours) if kind == "5h" else timedelta(days=7)
 
     implied: list[float] = []
@@ -400,11 +405,10 @@ def global_cap_from_anchors(
             anchor_ts = anchor_ts.replace(tzinfo=timezone.utc)
         util_anth = row[util_col]
 
-        # Walk forward through cache_sorted, tracking window_start using chart logic
         current_start = None
         last_ts = None
         burn_in_window = 0.0
-        for ts, cw in zip(ts_list, cw_list):
+        for ts, v in zip(ts_list, val_list):
             if ts > anchor_ts:
                 break
             if current_start is None:
@@ -412,7 +416,7 @@ def global_cap_from_anchors(
             elif (ts - last_ts) >= gap or (ts - current_start) >= gap:
                 current_start = ts
                 burn_in_window = 0.0
-            burn_in_window += float(cw)
+            burn_in_window += float(v)
             last_ts = ts
 
         if burn_in_window > 0 and util_anth > 0:

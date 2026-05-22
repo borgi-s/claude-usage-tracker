@@ -109,13 +109,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Plan caps (read-only)")
-    eff_pro_5h, eff_pro_week, caps_source = caps_mod.effective_caps()
-    st.caption(f"Source: {caps_source}")
-    st.text(f"Pro 5h cap: {eff_pro_5h/1e6:.1f}M")
-    st.text(f"Pro weekly cap: {eff_pro_week/1e6:.1f}M")
+    st.caption("Calibrated against output tokens — Anthropic's actual rate-limit signal.")
     show_max5x = st.checkbox("Show Max 5x line too", value=True)
-    pro_5h_raw = eff_pro_5h
-    pro_week_raw = eff_pro_week
 
     st.divider()
     st.subheader("Session table filter")
@@ -151,20 +146,20 @@ effective_5h_hours, n_observed_resets = metrics.effective_window_hours(
     calib_log_global, df, default=config.FIVE_HOUR_WINDOW_HOURS, min_samples=5,
 )
 
-max5x_5h_fallback = float(pro_5h_raw) * 5
-max5x_week_fallback = float(pro_week_raw) * 5
+OUTPUT_CAP_5H_FALLBACK = 2_100_000.0
+OUTPUT_CAP_WEEKLY_FALLBACK = 100_000_000.0
 global_cap_5h, n_anchor_5h = caps_mod.global_cap_from_anchors(
     calib_log_global, df, "5h", gap_hours=effective_5h_hours,
 )
 global_cap_week, n_anchor_week = caps_mod.global_cap_from_anchors(
     calib_log_global, df, "weekly", gap_hours=24 * 7,
 )
-effective_cap_5h = global_cap_5h if global_cap_5h else max5x_5h_fallback
-effective_cap_week = global_cap_week if global_cap_week else max5x_week_fallback
+effective_cap_5h = global_cap_5h if global_cap_5h else OUTPUT_CAP_5H_FALLBACK
+effective_cap_week = global_cap_week if global_cap_week else OUTPUT_CAP_WEEKLY_FALLBACK
 
 fdf_with_caps = fdf.with_columns(
-    (pl.col("cost_weighted_tokens") / effective_cap_5h).alias("share_5h"),
-    (pl.col("cost_weighted_tokens") / effective_cap_week).alias("share_week"),
+    (pl.col("output_tokens") / effective_cap_5h).alias("share_5h"),
+    (pl.col("output_tokens") / effective_cap_week).alias("share_week"),
 )
 
 total_cw = float(fdf["cost_weighted_tokens"].sum())
