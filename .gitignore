@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Project data — never commit
+cache.parquet
+caps.json
+calibration_log.parquet
+cache_manifest.json
+Figures/
+
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Claude Code / planning artifacts — local only
+CLAUDE.md
+CLAUDE.*.md
+.claude/
+plans/
