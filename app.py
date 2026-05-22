@@ -230,7 +230,7 @@ def live_usage_panel():
 live_usage_panel()
 
 
-render.render_calibration_history()
+render.render_calibration_history(load_data())
 
 
 # ---------- Sidebar ----------

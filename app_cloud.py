@@ -221,4 +221,4 @@ else:
     sessions_sorted = sessions_filtered.sort("start")
 render.render_sessions_table(sessions_sorted, hidden, min_turns, min_duration_s)
 
-render.render_calibration_history()
+render.render_calibration_history(df)

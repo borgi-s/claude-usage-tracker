@@ -192,10 +192,8 @@ def render_sessions_table(sessions_sorted: pl.DataFrame, hidden: int,
     st.dataframe(table, width="stretch", height=400)
 
 
-def render_calibration_history():
-    import cache
+def render_calibration_history(df_cache: pl.DataFrame):
     log = calibration_log.load_log()
-    df_cache = cache.load_cache()
     if log.is_empty():
         return
     implied = caps_mod.implied_cap_series(log)
