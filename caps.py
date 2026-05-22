@@ -396,6 +396,20 @@ def global_cap_from_anchors(
     val_list = cache_sorted[value_col].to_list()
     gap = timedelta(hours=gap_hours)
 
+    # For weekly, Anthropic's util_7d resets at WEEKLY_RESET (Sun 07:00 local by
+    # default), not rolling. We need the local tz to compute the most-recent reset.
+    tz = ZoneInfo(config.LOCAL_TZ) if kind == "weekly" else None
+
+    def _last_weekly_reset(anchor_ts_utc):
+        local = anchor_ts_utc.astimezone(tz)
+        days_back = (local.weekday() - config.WEEKLY_RESET_WEEKDAY) % 7
+        candidate = local.replace(
+            hour=config.WEEKLY_RESET_HOUR_LOCAL, minute=0, second=0, microsecond=0,
+        ) - timedelta(days=days_back)
+        if candidate > local:
+            candidate -= timedelta(days=7)
+        return candidate.astimezone(timezone.utc)
+
     implied: list[float] = []
     for row in anchors.iter_rows(named=True):
         anchor_ts = row["sampled_at"]
@@ -406,8 +420,7 @@ def global_cap_from_anchors(
         util_anth = row[util_col]
 
         if kind == "weekly":
-            # Anthropic's util_7d is a rolling 7-day window; sum the same.
-            win_start = anchor_ts - timedelta(days=7)
+            win_start = _last_weekly_reset(anchor_ts)
             burn_in_window = sum(
                 float(v) for ts, v in zip(ts_list, val_list)
                 if win_start <= ts <= anchor_ts
