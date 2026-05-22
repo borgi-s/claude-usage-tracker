@@ -394,7 +394,7 @@ def global_cap_from_anchors(
     cache_sorted = cache_df.sort("ts")
     ts_list = cache_sorted["ts"].to_list()
     val_list = cache_sorted[value_col].to_list()
-    gap = timedelta(hours=gap_hours) if kind == "5h" else timedelta(days=7)
+    gap = timedelta(hours=gap_hours)
 
     implied: list[float] = []
     for row in anchors.iter_rows(named=True):
@@ -405,19 +405,28 @@ def global_cap_from_anchors(
             anchor_ts = anchor_ts.replace(tzinfo=timezone.utc)
         util_anth = row[util_col]
 
-        current_start = None
-        last_ts = None
-        burn_in_window = 0.0
-        for ts, v in zip(ts_list, val_list):
-            if ts > anchor_ts:
-                break
-            if current_start is None:
-                current_start = ts
-            elif (ts - last_ts) >= gap or (ts - current_start) >= gap:
-                current_start = ts
-                burn_in_window = 0.0
-            burn_in_window += float(v)
-            last_ts = ts
+        if kind == "weekly":
+            # Anthropic's util_7d is a rolling 7-day window; sum the same.
+            win_start = anchor_ts - timedelta(days=7)
+            burn_in_window = sum(
+                float(v) for ts, v in zip(ts_list, val_list)
+                if win_start <= ts <= anchor_ts
+            )
+        else:
+            # 5h: replicate the chart's gap-based window detection.
+            current_start = None
+            last_ts = None
+            burn_in_window = 0.0
+            for ts, v in zip(ts_list, val_list):
+                if ts > anchor_ts:
+                    break
+                if current_start is None:
+                    current_start = ts
+                elif (ts - last_ts) >= gap or (ts - current_start) >= gap:
+                    current_start = ts
+                    burn_in_window = 0.0
+                burn_in_window += float(v)
+                last_ts = ts
 
         if burn_in_window > 0 and util_anth > 0:
             implied.append(burn_in_window / util_anth)

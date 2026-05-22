@@ -152,7 +152,7 @@ global_cap_5h, n_anchor_5h = caps_mod.global_cap_from_anchors(
     calib_log_global, df, "5h", gap_hours=effective_5h_hours,
 )
 global_cap_week, n_anchor_week = caps_mod.global_cap_from_anchors(
-    calib_log_global, df, "weekly", gap_hours=24 * 7,
+    calib_log_global, df, "weekly", gap_hours=24 * 7, min_util=0.10,
 )
 effective_cap_5h = global_cap_5h if global_cap_5h else OUTPUT_CAP_5H_FALLBACK
 effective_cap_week = global_cap_week if global_cap_week else OUTPUT_CAP_WEEKLY_FALLBACK
