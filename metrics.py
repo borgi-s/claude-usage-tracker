@@ -630,7 +630,8 @@ def session_cost_attribution(
       - sessions: one row per session_id with attributed_pct_5h, attributed_pct_weekly
         (0-1 fractions), prompt_tokens, n_requests, raw_total_tokens.
       - diagnostics: {"unattributed_5h": float, "unattributed_7d": float} — summed
-        delta (fraction) that matched no logged turn, per window.
+        delta (fraction) within valid same-window intervals that matched no logged turn.
+        Cross-reset and null-reset intervals are excluded entirely (not counted here).
     """
     out_schema = {
         "session_id": pl.Utf8,
@@ -665,15 +666,25 @@ def session_cost_attribution(
         )
         if lg.height < 2:
             return pl.DataFrame(schema=per_sess_schema), 0.0
+        # resets_*_iso are jittered ISO timestamps of the reset instant, not stable
+        # labels. Round to the minute to collapse the sub-second jitter into a stable
+        # per-window key; genuinely distinct windows are hours apart.
         lg = lg.with_columns(
+            pl.col("reset_id")
+            .str.to_datetime(format="%Y-%m-%dT%H:%M:%S%.f%z", strict=False)
+            .dt.round("1m")
+            .alias("win_key"),
+        ).with_columns(
             pl.col("sampled_at").shift(1).alias("start_ts"),
             pl.col("util").shift(1).alias("prev_util"),
-            pl.col("reset_id").shift(1).alias("prev_reset"),
+            pl.col("win_key").shift(1).alias("prev_win_key"),
         ).with_columns((pl.col("util") - pl.col("prev_util")).alias("delta"))
         intervals = (
             lg.filter(
                 pl.col("start_ts").is_not_null()
-                & (pl.col("reset_id") == pl.col("prev_reset"))
+                & pl.col("win_key").is_not_null()
+                & pl.col("prev_win_key").is_not_null()
+                & (pl.col("win_key") == pl.col("prev_win_key"))
                 & (pl.col("delta") > 0)
             )
             .select(
@@ -681,13 +692,15 @@ def session_cost_attribution(
                 pl.col("sampled_at").alias("end_ts"),
                 pl.col("delta"),
             )
-            .with_row_index("interval_id")
             .sort("end_ts")
+            .with_row_index("interval_id")
         )
         if intervals.is_empty():
             return pl.DataFrame(schema=per_sess_schema), 0.0
 
         tokens = df.select(["ts", "session_id", "output_tokens"]).sort("ts")
+        # Half-open (start_ts, end_ts]: forward asof picks the smallest end_ts >= ts,
+        # then the ts > start_ts filter drops rows that precede the matched interval.
         matched = tokens.join_asof(
             intervals, left_on="ts", right_on="end_ts", strategy="forward"
         ).filter(
@@ -707,7 +720,9 @@ def session_cost_attribution(
         per_sess = matched.group_by("session_id").agg(
             pl.col("attributed").sum().alias("attributed")
         )
-        attributed_total = float(matched["attributed"].sum()) if not matched.is_empty() else 0.0
+        # unattributed = within-window positive delta that matched no logged turn.
+        # (Cross-reset / null-reset intervals are excluded entirely, not counted here.)
+        attributed_total = float(matched["attributed"].sum() or 0.0)
         total_delta = float(intervals["delta"].sum())
         unattributed = max(0.0, total_delta - attributed_total)
         return per_sess, unattributed

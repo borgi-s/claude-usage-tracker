@@ -9,6 +9,15 @@ import metrics
 
 BASE = datetime(2026, 5, 18, 10, 0, tzinfo=timezone.utc)
 
+# resets_*_iso are jittered ISO timestamps of the reset instant. Two readings of the
+# SAME window differ only in sub-second jitter (round to the same minute); a different
+# window is hours away. These fixtures mirror that reality.
+R5 = "2026-05-18T15:00:00.069366+00:00"        # 5h window A
+R5b = "2026-05-18T15:00:00.773137+00:00"       # same window A, different jitter
+R5_NEXT = "2026-05-18T20:00:00.123456+00:00"   # 5h window B (a reset later)
+R7 = "2026-05-24T07:00:00.111111+00:00"        # weekly window
+R7b = "2026-05-24T07:00:00.888888+00:00"       # same weekly window, different jitter
+
 
 def _cache(rows: list[dict]) -> pl.DataFrame:
     """rows: dicts with ts, session_id, is_subagent, output_tokens,
@@ -48,9 +57,9 @@ def test_single_session_owns_window_gets_full_delta():
     ])
     log = _log([
         {"sampled_at": BASE, "util_5h": 0.0, "util_7d": 0.0,
-         "resets_5h_iso": "w1", "resets_7d_iso": "wk1"},
+         "resets_5h_iso": R5, "resets_7d_iso": R7},
         {"sampled_at": BASE + timedelta(minutes=5), "util_5h": 0.4, "util_7d": 0.1,
-         "resets_5h_iso": "w1", "resets_7d_iso": "wk1"},
+         "resets_5h_iso": R5b, "resets_7d_iso": R7b},
     ])
     sessions, diag = metrics.session_cost_attribution(df, log)
     row = sessions.filter(pl.col("session_id") == "A")
@@ -70,9 +79,9 @@ def test_overlapping_sessions_split_by_output_share():
     ])
     log = _log([
         {"sampled_at": BASE, "util_5h": 0.0, "util_7d": 0.0,
-         "resets_5h_iso": "w1", "resets_7d_iso": "wk1"},
+         "resets_5h_iso": R5, "resets_7d_iso": R7},
         {"sampled_at": BASE + timedelta(minutes=5), "util_5h": 0.4, "util_7d": 0.0,
-         "resets_5h_iso": "w1", "resets_7d_iso": "wk1"},
+         "resets_5h_iso": R5b, "resets_7d_iso": R7b},
     ])
     sessions, _ = metrics.session_cost_attribution(df, log)
     a = sessions.filter(pl.col("session_id") == "A")["attributed_pct_5h"].item()
@@ -88,9 +97,9 @@ def test_reset_straddling_pair_is_skipped():
     ])
     log = _log([
         {"sampled_at": BASE, "util_5h": 0.9, "util_7d": 0.0,
-         "resets_5h_iso": "w1", "resets_7d_iso": "wk1"},
+         "resets_5h_iso": R5, "resets_7d_iso": R7},
         {"sampled_at": BASE + timedelta(minutes=5), "util_5h": 0.1, "util_7d": 0.0,
-         "resets_5h_iso": "w2", "resets_7d_iso": "wk1"},  # new 5h window
+         "resets_5h_iso": R5_NEXT, "resets_7d_iso": R7b},  # new 5h window (hours later)
     ])
     sessions, diag = metrics.session_cost_attribution(df, log)
     assert sessions.filter(pl.col("session_id") == "A")["attributed_pct_5h"].item() == 0.0
@@ -104,9 +113,9 @@ def test_delta_with_no_turns_is_unattributed():
     ])
     log = _log([
         {"sampled_at": BASE, "util_5h": 0.0, "util_7d": 0.0,
-         "resets_5h_iso": "w1", "resets_7d_iso": "wk1"},
+         "resets_5h_iso": R5, "resets_7d_iso": R7},
         {"sampled_at": BASE + timedelta(minutes=5), "util_5h": 0.2, "util_7d": 0.0,
-         "resets_5h_iso": "w1", "resets_7d_iso": "wk1"},
+         "resets_5h_iso": R5b, "resets_7d_iso": R7b},
     ])
     sessions, diag = metrics.session_cost_attribution(df, log)
     assert sessions.filter(pl.col("session_id") == "A")["attributed_pct_5h"].item() == 0.0
@@ -122,14 +131,52 @@ def test_subagent_output_folds_into_parent_session():
     ])
     log = _log([
         {"sampled_at": BASE, "util_5h": 0.0, "util_7d": 0.0,
-         "resets_5h_iso": "w1", "resets_7d_iso": "wk1"},
+         "resets_5h_iso": R5, "resets_7d_iso": R7},
         {"sampled_at": BASE + timedelta(minutes=5), "util_5h": 0.4, "util_7d": 0.0,
-         "resets_5h_iso": "w1", "resets_7d_iso": "wk1"},
+         "resets_5h_iso": R5b, "resets_7d_iso": R7b},
     ])
     sessions, _ = metrics.session_cost_attribution(df, log)
     row = sessions.filter(pl.col("session_id") == "A")
     assert abs(row["attributed_pct_5h"].item() - 0.4) < 1e-9  # both turns counted
     assert row["n_requests"].item() == 1  # only the main turn
+
+
+def test_jittered_reset_ids_same_window_attributes():
+    """Regression: sub-second jitter in resets_5h_iso must NOT split one window."""
+    df = _cache([
+        {"ts": BASE + timedelta(minutes=2), "session_id": "A", "is_subagent": False,
+         "output_tokens": 100, "prompt_tokens": 1000, "raw_total_tokens": 1100},
+        {"ts": BASE + timedelta(minutes=7), "session_id": "A", "is_subagent": False,
+         "output_tokens": 100, "prompt_tokens": 1500, "raw_total_tokens": 1600},
+    ])
+    log = _log([
+        {"sampled_at": BASE, "util_5h": 0.0, "util_7d": 0.0,
+         "resets_5h_iso": "2026-05-18T15:00:00.069366+00:00", "resets_7d_iso": R7},
+        {"sampled_at": BASE + timedelta(minutes=5), "util_5h": 0.2, "util_7d": 0.0,
+         "resets_5h_iso": "2026-05-18T15:00:00.512741+00:00", "resets_7d_iso": R7},
+        {"sampled_at": BASE + timedelta(minutes=10), "util_5h": 0.4, "util_7d": 0.0,
+         "resets_5h_iso": "2026-05-18T15:00:00.998003+00:00", "resets_7d_iso": R7},
+    ])
+    sessions, _ = metrics.session_cost_attribution(df, log)
+    # All three samples are the same window → two valid intervals → 0.2 + 0.2 = 0.4.
+    assert abs(sessions.filter(pl.col("session_id") == "A")["attributed_pct_5h"].item() - 0.4) < 1e-9
+
+
+def test_null_reset_id_excluded():
+    """A pair where either reset id is null cannot be assigned a window → excluded."""
+    df = _cache([
+        {"ts": BASE + timedelta(minutes=2), "session_id": "A", "is_subagent": False,
+         "output_tokens": 100, "prompt_tokens": 1000, "raw_total_tokens": 1100},
+    ])
+    log = _log([
+        {"sampled_at": BASE, "util_5h": 0.0, "util_7d": 0.0,
+         "resets_5h_iso": None, "resets_7d_iso": R7},
+        {"sampled_at": BASE + timedelta(minutes=5), "util_5h": 0.4, "util_7d": 0.0,
+         "resets_5h_iso": R5, "resets_7d_iso": R7b},
+    ])
+    sessions, diag = metrics.session_cost_attribution(df, log)
+    assert sessions.filter(pl.col("session_id") == "A")["attributed_pct_5h"].item() == 0.0
+    assert diag["unattributed_5h"] == 0.0
 
 
 def test_empty_inputs_return_empty():
