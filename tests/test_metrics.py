@@ -130,3 +130,50 @@ def test_five_hour_no_mask_selected_equals_total():
         pl.col("ts").is_in(ts_filter) & (pl.col("cumulative_total") != 0)
     ).sort("ts")
     assert real["cumulative_selected"].to_list() == real["cumulative_total"].to_list()
+
+
+def test_downsample_cumulative_reduces_to_target_size():
+    base = datetime(2026, 5, 1, 0, 0, tzinfo=timezone.utc)
+    rows = []
+    for i in range(2000):
+        rows.append({
+            "ts": base + timedelta(minutes=i),
+            "cumulative_total": float(i),
+            "cumulative_selected": float(i),
+            "cumulative_main": float(i),
+            "cumulative_sub": 0.0,
+        })
+    df = pl.DataFrame(rows, schema={
+        "ts": pl.Datetime("ms", "UTC"),
+        "cumulative_total": pl.Float64,
+        "cumulative_selected": pl.Float64,
+        "cumulative_main": pl.Float64,
+        "cumulative_sub": pl.Float64,
+    })
+    out = metrics.downsample_cumulative(df, max_points=500)
+    assert out.height <= 600  # 500 target + slack
+    # First and last values preserved
+    assert out["cumulative_total"].to_list()[0] == 0.0
+    assert out["cumulative_total"].to_list()[-1] == 1999.0
+
+
+def test_downsample_cumulative_passthrough_for_small_input():
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    df = pl.DataFrame(
+        {
+            "ts": [base, base + timedelta(minutes=1)],
+            "cumulative_total": [1.0, 2.0],
+            "cumulative_selected": [1.0, 2.0],
+            "cumulative_main": [1.0, 2.0],
+            "cumulative_sub": [0.0, 0.0],
+        },
+        schema={
+            "ts": pl.Datetime("ms", "UTC"),
+            "cumulative_total": pl.Float64,
+            "cumulative_selected": pl.Float64,
+            "cumulative_main": pl.Float64,
+            "cumulative_sub": pl.Float64,
+        },
+    )
+    out = metrics.downsample_cumulative(df, max_points=500)
+    assert out.equals(df)

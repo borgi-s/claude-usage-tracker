@@ -470,6 +470,45 @@ def weekly_burn_since_reset(
     return out
 
 
+def downsample_cumulative(df: pl.DataFrame, max_points: int = 500) -> pl.DataFrame:
+    """Reduce a cumulative-series df to ~max_points rows via time-binning.
+
+    Cumulative values monotonically climb within a window, so taking the LAST value
+    per bin preserves the climb shape. The first and last rows of the input are always
+    retained so boundary values are never lost. Input df must have columns: ts (Datetime),
+    cumulative_total, cumulative_selected, cumulative_main, cumulative_sub.
+    """
+    if df.height <= max_points:
+        return df
+    span = (df["ts"].max() - df["ts"].min()).total_seconds()
+    if span <= 0:
+        return df
+    bin_seconds = max(60.0, span / max_points)
+    bin_ms = int(bin_seconds * 1000)
+    t0_ms_int = int(df["ts"].min().timestamp() * 1000)  # type: ignore[union-attr]
+    cols = ["ts", "cumulative_total", "cumulative_selected", "cumulative_main", "cumulative_sub"]
+    binned = (
+        df.sort("ts")
+        .with_columns(
+            (((pl.col("ts").dt.timestamp("ms") - t0_ms_int) // bin_ms) * bin_ms + t0_ms_int)
+            .cast(pl.Datetime("ms", "UTC")).alias("bin"),
+        )
+        .group_by("bin")
+        .agg(
+            pl.col("cumulative_total").sort_by("ts").last(),
+            pl.col("cumulative_selected").sort_by("ts").last(),
+            pl.col("cumulative_main").sort_by("ts").last(),
+            pl.col("cumulative_sub").sort_by("ts").last(),
+        )
+        .sort("bin")
+        .rename({"bin": "ts"})
+    )
+    # Always preserve first and last rows so boundary values are never lost.
+    # Boundary rows go first so unique("ts", keep="first") retains them over bin aggregates.
+    boundary = pl.concat([df.select(cols).head(1), df.select(cols).tail(1)])
+    return pl.concat([boundary, binned]).unique("ts", keep="first").sort("ts")
+
+
 def session_summaries(df: pl.DataFrame) -> pl.DataFrame:
     """Per-session: start, end, peak_context_pct, total_cost_weighted, subagent_count, model."""
     if df.is_empty():
