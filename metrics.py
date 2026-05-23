@@ -474,9 +474,16 @@ def downsample_cumulative(df: pl.DataFrame, max_points: int = 500) -> pl.DataFra
     """Reduce a cumulative-series df to ~max_points rows via time-binning.
 
     Cumulative values monotonically climb within a window, so taking the LAST value
-    per bin preserves the climb shape. The first and last rows of the input are always
-    retained so boundary values are never lost. Input df must have columns: ts (Datetime),
-    cumulative_total, cumulative_selected, cumulative_main, cumulative_sub.
+    per bin preserves the climb shape. Bins are aligned to the first row's
+    timestamp (t0-relative, not Unix-epoch-floored). The exact first and last
+    rows are always preserved in the output regardless of binning.
+
+    Pass-through cases (input returned unchanged):
+    - df.height <= max_points
+    - span (last ts - first ts) <= 0
+
+    Input df must have columns: ts (Datetime), cumulative_total,
+    cumulative_selected, cumulative_main, cumulative_sub.
     """
     if df.height <= max_points:
         return df

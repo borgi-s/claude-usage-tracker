@@ -153,7 +153,7 @@ def test_downsample_cumulative_reduces_to_target_size():
         "cumulative_sub": pl.Float64,
     })
     out = metrics.downsample_cumulative(df, max_points=500)
-    assert out.height <= 600  # 500 target + slack
+    assert out.height <= 502  # 500 bins + 2 boundary rows (head/tail pinning)
     # First and last values preserved
     assert out["cumulative_total"].to_list()[0] == 0.0
     assert out["cumulative_total"].to_list()[-1] == 1999.0
