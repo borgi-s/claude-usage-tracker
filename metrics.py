@@ -666,25 +666,25 @@ def session_cost_attribution(
         )
         if lg.height < 2:
             return pl.DataFrame(schema=per_sess_schema), 0.0
-        # resets_*_iso are jittered ISO timestamps of the reset instant, not stable
-        # labels. Round to the minute to collapse the sub-second jitter into a stable
-        # per-window key; genuinely distinct windows are hours apart.
+        # resets_*_iso are ISO timestamps of the window's reset instant carrying ~1s
+        # of jitter (they are NOT stable labels). Two consecutive samples are the same
+        # window iff both reset instants parse and are within an hour of each other;
+        # genuinely distinct windows are ≥5h (5h) / 7d (weekly) apart.
         lg = lg.with_columns(
             pl.col("reset_id")
             .str.to_datetime(format="%Y-%m-%dT%H:%M:%S%.f%z", strict=False)
-            .dt.round("1m")
-            .alias("win_key"),
+            .alias("win_dt"),
         ).with_columns(
             pl.col("sampled_at").shift(1).alias("start_ts"),
             pl.col("util").shift(1).alias("prev_util"),
-            pl.col("win_key").shift(1).alias("prev_win_key"),
+            pl.col("win_dt").shift(1).alias("prev_win_dt"),
         ).with_columns((pl.col("util") - pl.col("prev_util")).alias("delta"))
         intervals = (
             lg.filter(
                 pl.col("start_ts").is_not_null()
-                & pl.col("win_key").is_not_null()
-                & pl.col("prev_win_key").is_not_null()
-                & (pl.col("win_key") == pl.col("prev_win_key"))
+                & pl.col("win_dt").is_not_null()
+                & pl.col("prev_win_dt").is_not_null()
+                & ((pl.col("win_dt") - pl.col("prev_win_dt")).dt.total_seconds().abs() <= 3600)
                 & (pl.col("delta") > 0)
             )
             .select(
