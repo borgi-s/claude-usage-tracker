@@ -245,16 +245,6 @@ with st.sidebar:
         st.info("Cache empty. Click Refresh.")
         st.stop()
 
-    min_ts = df["ts"].min()
-    max_ts = df["ts"].max()
-    default_start = max(min_ts.date(), (max_ts - timedelta(days=14)).date())
-    date_range = st.date_input(
-        "Date range",
-        value=(default_start, max_ts.date()),
-        min_value=min_ts.date(),
-        max_value=max_ts.date(),
-    )
-
     # cwd → short label for the picker
     cwd_to_short = {c: render.short_project(c) for c in df["project_cwd"].unique().to_list() if c}
     short_to_cwd: dict[str, list[str]] = {}
@@ -289,23 +279,23 @@ allowed_cwds = []
 for s in selected_projects:
     allowed_cwds.extend(short_to_cwd.get(s, []))
 
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    start_d, end_d = date_range
-else:
-    start_d = end_d = date_range  # type: ignore[assignment]
-
-start_ts = datetime.combine(start_d, datetime.min.time(), tzinfo=timezone.utc)
-end_ts = datetime.combine(end_d, datetime.max.time(), tzinfo=timezone.utc)
-
-fdf = df.filter(
-    pl.col("ts").is_between(start_ts, end_ts)
-    & pl.col("project_cwd").is_in(allowed_cwds)
-    & pl.col("model").is_in(selected_models)
+# Per-row selected mask (project + model). Full df flows through cumulative
+# computation; mask controls what's emphasized in the "project share" view.
+df_with_mask = df.with_columns(
+    (pl.col("project_cwd").is_in(allowed_cwds) & pl.col("model").is_in(selected_models))
+    .alias("is_selected")
 )
+
+# fdf is the date-unfiltered, project+model-filtered subset for daily bar + session table.
+fdf = df_with_mask.filter(pl.col("is_selected"))
 
 if fdf.is_empty():
     st.warning("No data matches the current filters.")
     st.stop()
+
+# Bounds for calendar-band shading — span the full df, not the filtered subset.
+data_start_ts = df["ts"].min()
+data_end_ts = df["ts"].max()
 
 
 # ---------- Single global cap derived from 100% anchors ----------
@@ -327,34 +317,38 @@ global_cap_week, n_anchor_week = caps_mod.global_cap_from_anchors(
 effective_cap_5h = global_cap_5h if global_cap_5h else OUTPUT_CAP_5H_FALLBACK
 effective_cap_week = global_cap_week if global_cap_week else OUTPUT_CAP_WEEKLY_FALLBACK
 
-fdf_with_caps = fdf.with_columns(
+df_with_caps = df_with_mask.with_columns(
     (pl.col("output_tokens") / effective_cap_5h).alias("share_5h"),
     (pl.col("output_tokens") / effective_cap_week).alias("share_week"),
 )
 
 
 # ---------- KPIs ----------
-total_cw = float(fdf["cost_weighted_tokens"].sum())
+# Lifetime KPIs (over full df, not project-filtered — represents true cap usage)
+total_cw = float(df["cost_weighted_tokens"].sum())
 sessions = metrics.session_summaries(fdf)
 five_h = metrics.five_hour_burn_since_reset(
-    fdf_with_caps, gap_hours=effective_5h_hours, value_col="share_5h",
+    df_with_caps, gap_hours=effective_5h_hours,
+    value_col="share_5h", selected_mask_col="is_selected",
 )
-weekly = metrics.weekly_burn_since_reset(fdf_with_caps, value_col="share_week")
+weekly = metrics.weekly_burn_since_reset(
+    df_with_caps, value_col="share_week", selected_mask_col="is_selected",
+)
 peak_5h_share = float(five_h["cumulative_total"].max() or 0)
 peak_weekly_share = float(weekly["cumulative_total"].max() or 0)
 
-span_days = max((fdf["ts"].max() - fdf["ts"].min()).total_seconds() / 86400.0, 1.0)
+span_days = max((df["ts"].max() - df["ts"].min()).total_seconds() / 86400.0, 1.0)
 daily_avg = total_cw / span_days
 
-# Per-window totals in SHARES, compared against Pro = 0.20 of Max5x
+# Per-window totals across the full df (not project-filtered) for lifetime KPI honesty
 five_h_window_shares = metrics.five_hour_window_totals(
-    fdf_with_caps, gap_hours=effective_5h_hours, value_col="share_5h",
+    df_with_caps, gap_hours=effective_5h_hours, value_col="share_5h",
 )
 windows_over_pro_5h = sum(1 for s in five_h_window_shares if s > 0.20)
 windows_total_5h = len(five_h_window_shares)
 
 per_week_shares = (
-    fdf_with_caps.with_columns(
+    df_with_caps.with_columns(
         pl.col("ts")
         .map_elements(metrics.week_start_for, return_dtype=pl.Datetime("us", "UTC"))
         .cast(pl.Datetime("ms", "UTC"))
@@ -371,14 +365,18 @@ render.render_kpis(total_cw, daily_avg, peak_5h_share, peak_weekly_share,
 
 
 # ---------- Chart 1: 5h fixed window ----------
-render.render_5h_chart(five_h, effective_5h_hours, n_observed_resets, n_anchor_5h,
-                       effective_cap_5h, show_max5x, start_ts, end_ts)
-
+render.render_5h_chart(
+    five_h, effective_5h_hours, n_observed_resets, n_anchor_5h,
+    effective_cap_5h, show_max5x, data_start_ts, data_end_ts,
+    decomposition_key="app",
+)
 
 # ---------- Chart 2: Weekly cumulative (fixed reset) ----------
-render.render_weekly_chart(weekly, n_anchor_week, effective_cap_week,
-                           show_max5x, start_ts, end_ts)
-
+render.render_weekly_chart(
+    weekly, n_anchor_week, effective_cap_week,
+    show_max5x, data_start_ts, data_end_ts,
+    decomposition_key="app",
+)
 
 # ---------- Chart 3: Daily stacked ----------
 daily = metrics.daily_stacked(fdf)
