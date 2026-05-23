@@ -29,12 +29,24 @@ The local agent samples the API every 5 minutes. Each calibration-log row carrie
 `sampled_at`, `util_5h`, `util_7d` (stored as 0.0–1.0 fractions), `resets_5h_iso`,
 and `resets_7d_iso`.
 
+**Window identity (important, empirically grounded).** `resets_5h_iso` /
+`resets_7d_iso` are **ISO-8601 timestamps of the window's reset instant carrying
+sub-second jitter** — Anthropic reports the same window's reset moment with a
+slightly different fractional second on every poll (verified: ~462 distinct
+`resets_5h_iso` strings across 554 log rows, ~17% null). They are **not** stable
+per-window labels, so raw string equality never matches in production. To identify a
+window, parse the reset timestamp and **round it to the nearest minute** — this
+collapses the sub-second jitter while keeping genuinely distinct windows apart (5h
+windows are ~5h apart, weekly ~7d apart). Null/unparseable reset values yield a null
+window key and their intervals are excluded.
+
 For a given window kind (`5h` or `weekly`):
 
 1. Sort the log by `sampled_at`. Walk consecutive sample pairs `(tᵢ₋₁, tᵢ]`.
-2. Only diff a pair when both samples share the **same** reset id
-   (`resets_5h_iso` for 5h, `resets_7d_iso` for weekly). Pairs straddling a reset
-   are skipped — at most one dropped interval per window, negligible.
+2. Only diff a pair when both samples have a non-null window key **and the same**
+   window key (reset timestamp rounded to the minute; `resets_5h_iso` for 5h,
+   `resets_7d_iso` for weekly). Pairs straddling a reset, or with a null reset on
+   either side, are skipped.
 3. `Δutil = max(0, util(tᵢ) − util(tᵢ₋₁))`.
 4. From the cache, sum `output_tokens` per `session_id` over all turns
    (main **and** subagent — subagent rows carry the parent `session_id`) whose `ts`
@@ -59,6 +71,10 @@ every session regardless of overlap.
   sessions almost never cross the Sunday 07:00 reset.
 - Sessions with zero output in an interval receive nothing from that interval —
   correct.
+- The `unattributed_*` diagnostic counts only **within-window** positive deltas that
+  had no matching logged turn. Deltas across a reset boundary or with a null reset key
+  are excluded from the analysis entirely (not counted as unattributed), since diffing
+  across a reset is not a meaningful within-window burn signal.
 - The unattributable total is surfaced as a small caption ("X% of measured burn
   could not be matched to a session") for transparency, not plotted.
 
