@@ -376,23 +376,32 @@ def five_hour_window_totals(
 def weekly_burn_since_reset(
     df: pl.DataFrame,
     value_col: str = "cost_weighted_tokens",
+    selected_mask_col: str | None = None,
 ) -> pl.DataFrame:
-    """Cumulative cost-weighted burn within each fixed weekly window.
+    """Cumulative burn within each fixed weekly window.
 
-    Returns ts, week_start, cumulative_total, cumulative_main, cumulative_sub.
-    Inserts a zero-valued reset row at each week boundary so the plot shows
-    a clean sawtooth (step-down at boundary, then climb).
+    Returns ts, cumulative_total, cumulative_selected, cumulative_main, cumulative_sub.
+    - cumulative_total: sum over ALL rows
+    - cumulative_selected: sum over rows where selected_mask_col is True (or all rows if None)
+    - cumulative_main: sum over selected rows that are NOT subagents
+    - cumulative_sub:  sum over selected rows that ARE subagents
+
+    Inserts a zero-valued reset row at each week boundary for clean sawtooth rendering.
     """
+    schema = {
+        "ts": pl.Datetime("ms", "UTC"),
+        "cumulative_total": pl.Float64,
+        "cumulative_selected": pl.Float64,
+        "cumulative_main": pl.Float64,
+        "cumulative_sub": pl.Float64,
+    }
     if df.is_empty():
-        return pl.DataFrame(schema={
-            "ts": pl.Datetime("ms", "UTC"),
-            "cumulative_total": pl.Float64,
-            "cumulative_main": pl.Float64,
-            "cumulative_sub": pl.Float64,
-        })
+        return pl.DataFrame(schema=schema)
+
+    selected = pl.col(selected_mask_col) if selected_mask_col else pl.lit(True)
 
     work = (
-        df.select(["ts", value_col, "is_subagent"])
+        df.select(["ts", value_col, "is_subagent"] + ([selected_mask_col] if selected_mask_col else []))
         .sort("ts")
         .with_columns(
             pl.col("ts")
@@ -403,40 +412,41 @@ def weekly_burn_since_reset(
     )
     work = work.with_columns(
         pl.col(value_col).cum_sum().over("week_start").alias("cumulative_total"),
-        pl.when(pl.col("is_subagent")).then(0.0)
-          .otherwise(pl.col(value_col))
+        pl.when(selected).then(pl.col(value_col)).otherwise(0.0)
+          .cum_sum().over("week_start").alias("cumulative_selected"),
+        pl.when(selected & ~pl.col("is_subagent")).then(pl.col(value_col)).otherwise(0.0)
           .cum_sum().over("week_start").alias("cumulative_main"),
-        pl.when(pl.col("is_subagent")).then(pl.col(value_col))
-          .otherwise(0.0)
+        pl.when(selected & pl.col("is_subagent")).then(pl.col(value_col)).otherwise(0.0)
           .cum_sum().over("week_start").alias("cumulative_sub"),
     )
 
-    # Reset markers — one zero row at each week boundary
     week_starts = work["week_start"].unique().sort().to_list()
     if week_starts:
         reset_df = pl.DataFrame(
             {
                 "ts": week_starts,
                 "cumulative_total": [0.0] * len(week_starts),
+                "cumulative_selected": [0.0] * len(week_starts),
                 "cumulative_main": [0.0] * len(week_starts),
                 "cumulative_sub": [0.0] * len(week_starts),
             },
-            schema={
-                "ts": pl.Datetime("ms", "UTC"),
-                "cumulative_total": pl.Float64,
-                "cumulative_main": pl.Float64,
-                "cumulative_sub": pl.Float64,
-            },
+            schema=schema,
         )
         out = pl.concat(
             [
-                work.select(["ts", "cumulative_total", "cumulative_main", "cumulative_sub"]),
+                work.select([
+                    "ts", "cumulative_total", "cumulative_selected",
+                    "cumulative_main", "cumulative_sub",
+                ]),
                 reset_df,
             ],
             how="diagonal",
         ).sort("ts")
     else:
-        out = work.select(["ts", "cumulative_total", "cumulative_main", "cumulative_sub"])
+        out = work.select([
+            "ts", "cumulative_total", "cumulative_selected",
+            "cumulative_main", "cumulative_sub",
+        ])
 
     return out
 
