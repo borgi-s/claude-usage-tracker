@@ -91,7 +91,7 @@ def _render_usage_view(
         st.caption(prefix + f" · sub `{sub_type}` tier `{rate_limit_tier}`  ·  utilization too low to derive caps yet.")
 
 
-@st.fragment(run_every=60)
+@st.fragment(run_every=300)
 def live_usage_panel():
     st.subheader("Live plan usage")
     # Keep the chart data fresh: incremental disk reparse + force full app
