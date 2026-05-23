@@ -780,6 +780,6 @@ def bin_sessions(
             pl.col("y").std().alias("std_y"),
             pl.len().cast(pl.Int64).alias("n"),
         )
-        .sort("bin_median_x")
+        .sort("bin")  # bin index == ascending-x quantile order; stable under x-ties
         .select(list(schema.keys()))
     )
