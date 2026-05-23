@@ -9,7 +9,7 @@ import pytest
 import metrics
 
 
-def _build_weekly_df(rows: list[tuple[datetime, float, bool, bool]]) -> pl.DataFrame:
+def _build_df(rows: list[tuple[datetime, float, bool, bool]]) -> pl.DataFrame:
     """rows: list of (ts, value, is_subagent, is_selected)."""
     return pl.DataFrame(
         {
@@ -35,7 +35,7 @@ def test_weekly_cumulative_total_uses_all_rows_not_just_selected():
         (base + timedelta(hours=1), 20.0, False, True),
         (base + timedelta(hours=2), 30.0, False, True),
     ]
-    df = _build_weekly_df(rows)
+    df = _build_df(rows)
     out = metrics.weekly_burn_since_reset(
         df, value_col="value", selected_mask_col="is_selected"
     )
@@ -55,7 +55,7 @@ def test_weekly_cumulative_anchor_survives_view_cropping():
         (base + timedelta(hours=12), 200.0, False, True),
         (base + timedelta(days=2),   300.0, False, True),  # Wed
     ]
-    df = _build_weekly_df(rows)
+    df = _build_df(rows)
     full = metrics.weekly_burn_since_reset(df, value_col="value", selected_mask_col="is_selected")
     display_start = base + timedelta(days=2)
     cropped = full.filter(pl.col("ts") >= display_start)
@@ -71,7 +71,7 @@ def test_weekly_no_mask_selected_equals_total():
         (base, 10.0, False, False),
         (base + timedelta(hours=1), 20.0, True, False),
     ]
-    df = _build_weekly_df(rows)
+    df = _build_df(rows)
     out = metrics.weekly_burn_since_reset(df, value_col="value", selected_mask_col=None)
     ts_filter = pl.Series("ts", [r[0] for r in rows]).cast(pl.Datetime("ms", "UTC")).implode()
     real = out.filter(pl.col("ts").is_in(ts_filter)).sort("ts")
@@ -79,6 +79,7 @@ def test_weekly_no_mask_selected_equals_total():
 
 
 def test_five_hour_cumulative_total_uses_all_rows_not_just_selected():
+    """The selected_mask_col must NOT affect cumulative_total — only cumulative_selected."""
     base = datetime(2026, 5, 22, 9, 0, tzinfo=timezone.utc)
     # All within one 5h window
     rows = [
@@ -86,7 +87,7 @@ def test_five_hour_cumulative_total_uses_all_rows_not_just_selected():
         (base + timedelta(minutes=30), 20.0, False, True),
         (base + timedelta(minutes=60), 30.0, False, True),
     ]
-    df = _build_weekly_df(rows)  # same schema works
+    df = _build_df(rows)  # same schema works
     out = metrics.five_hour_burn_since_reset(
         df, value_col="value", selected_mask_col="is_selected",
     )
@@ -101,13 +102,14 @@ def test_five_hour_cumulative_total_uses_all_rows_not_just_selected():
 
 
 def test_five_hour_cumulative_anchor_survives_view_cropping():
+    """Regression: cropping the output after computation must not reset the cumulative anchor."""
     base = datetime(2026, 5, 22, 9, 0, tzinfo=timezone.utc)
     rows = [
         (base + timedelta(minutes=0),   100.0, False, True),
         (base + timedelta(minutes=60),  200.0, False, True),
         (base + timedelta(minutes=120), 300.0, False, True),
     ]
-    df = _build_weekly_df(rows)
+    df = _build_df(rows)
     full = metrics.five_hour_burn_since_reset(df, value_col="value", selected_mask_col="is_selected")
     cropped = full.filter(pl.col("ts") >= base + timedelta(minutes=120))
     last_row = cropped.filter(pl.col("ts") == rows[2][0])
@@ -121,7 +123,7 @@ def test_five_hour_no_mask_selected_equals_total():
         (base, 10.0, False, False),
         (base + timedelta(minutes=30), 20.0, True, False),
     ]
-    df = _build_weekly_df(rows)
+    df = _build_df(rows)
     out = metrics.five_hour_burn_since_reset(df, value_col="value", selected_mask_col=None)
     ts_filter = pl.Series("ts", [r[0] for r in rows]).cast(pl.Datetime("ms", "UTC")).implode()
     # Exclude reset rows: when window_start equals a real data row's ts, the reset row
