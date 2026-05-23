@@ -184,3 +184,35 @@ def test_empty_inputs_return_empty():
     sessions, diag = metrics.session_cost_attribution(empty, _log([]))
     assert sessions.is_empty()
     assert diag == {"unattributed_5h": 0.0, "unattributed_7d": 0.0}
+
+
+def test_bin_sessions_quantile_means_and_counts():
+    sessions = pl.DataFrame({
+        "x": [1.0, 2.0, 3.0, 4.0],
+        "y": [10.0, 20.0, 30.0, 40.0],
+    })
+    out = metrics.bin_sessions(sessions, "x", "y", n_bins=2)
+    assert out.height == 2
+    assert out["n"].to_list() == [2, 2]
+    assert out["mean_y"].to_list() == [15.0, 35.0]      # (10,20) and (30,40)
+    assert out["bin_median_x"].to_list() == [1.5, 3.5]
+
+
+def test_bin_sessions_single_member_bin_has_null_std():
+    sessions = pl.DataFrame({"x": [1.0], "y": [5.0]})
+    out = metrics.bin_sessions(sessions, "x", "y", n_bins=4)
+    assert out.height == 1
+    assert out["n"].item() == 1
+    assert out["std_y"].item() is None  # std of one element
+
+
+def test_bin_sessions_more_bins_than_rows_collapses():
+    sessions = pl.DataFrame({"x": [1.0, 2.0, 3.0], "y": [1.0, 2.0, 3.0]})
+    out = metrics.bin_sessions(sessions, "x", "y", n_bins=10)
+    assert out.height == 3  # clamped to row count, one session per bin
+
+
+def test_bin_sessions_empty_returns_empty():
+    empty = pl.DataFrame(schema={"x": pl.Float64, "y": pl.Float64})
+    out = metrics.bin_sessions(empty, "x", "y", n_bins=8)
+    assert out.is_empty()

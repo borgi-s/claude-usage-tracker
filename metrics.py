@@ -743,3 +743,43 @@ def session_cost_attribution(
         .select(list(out_schema.keys()))
     )
     return out, diagnostics
+
+
+def bin_sessions(
+    sessions: pl.DataFrame, x_col: str, y_col: str, n_bins: int
+) -> pl.DataFrame:
+    """Quantile-bin sessions on x_col (equal count per bin) and aggregate y_col.
+
+    Returns columns bin_median_x, mean_y, std_y, n, sorted by bin_median_x.
+    std_y is null for single-member bins.
+    """
+    schema = {
+        "bin_median_x": pl.Float64,
+        "mean_y": pl.Float64,
+        "std_y": pl.Float64,
+        "n": pl.Int64,
+    }
+    if sessions.is_empty() or x_col not in sessions.columns or y_col not in sessions.columns:
+        return pl.DataFrame(schema=schema)
+    s = sessions.select(
+        pl.col(x_col).cast(pl.Float64).alias("x"),
+        pl.col(y_col).cast(pl.Float64).alias("y"),
+    ).drop_nulls()
+    if s.is_empty():
+        return pl.DataFrame(schema=schema)
+    n_bins = max(1, min(n_bins, s.height))
+    s = s.with_columns(
+        (((pl.col("x").rank(method="ordinal") - 1).cast(pl.Int64) * n_bins) // pl.len())
+        .alias("bin")
+    )
+    return (
+        s.group_by("bin")
+        .agg(
+            pl.col("x").median().alias("bin_median_x"),
+            pl.col("y").mean().alias("mean_y"),
+            pl.col("y").std().alias("std_y"),
+            pl.len().cast(pl.Int64).alias("n"),
+        )
+        .sort("bin_median_x")
+        .select(list(schema.keys()))
+    )
