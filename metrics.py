@@ -619,3 +619,112 @@ def detect_compactions(main_curve: pl.DataFrame, drop_ratio: float = 0.4, min_dr
         pl.col("prompt_tokens").alias("before"),
         pl.col("next_pt").alias("after"),
     )
+
+
+def session_cost_attribution(
+    df: pl.DataFrame, log: pl.DataFrame
+) -> tuple[pl.DataFrame, dict]:
+    """Attribute each window's API utilization delta to sessions by output-token share.
+
+    Returns (sessions, diagnostics):
+      - sessions: one row per session_id with attributed_pct_5h, attributed_pct_weekly
+        (0-1 fractions), prompt_tokens, n_requests, raw_total_tokens.
+      - diagnostics: {"unattributed_5h": float, "unattributed_7d": float} — summed
+        delta (fraction) that matched no logged turn, per window.
+    """
+    out_schema = {
+        "session_id": pl.Utf8,
+        "attributed_pct_5h": pl.Float64,
+        "attributed_pct_weekly": pl.Float64,
+        "prompt_tokens": pl.Int64,
+        "n_requests": pl.Int64,
+        "raw_total_tokens": pl.Int64,
+    }
+    diagnostics = {"unattributed_5h": 0.0, "unattributed_7d": 0.0}
+    if df.is_empty():
+        return pl.DataFrame(schema=out_schema), diagnostics
+
+    per_session = df.group_by("session_id").agg(
+        pl.col("prompt_tokens").sum().cast(pl.Int64).alias("prompt_tokens"),
+        pl.col("raw_total_tokens").sum().cast(pl.Int64).alias("raw_total_tokens"),
+        (~pl.col("is_subagent")).sum().cast(pl.Int64).alias("n_requests"),
+    )
+
+    def attribute(util_col: str, reset_col: str) -> tuple[pl.DataFrame, float]:
+        per_sess_schema = {"session_id": pl.Utf8, "attributed": pl.Float64}
+        if log.is_empty() or util_col not in log.columns:
+            return pl.DataFrame(schema=per_sess_schema), 0.0
+        lg = (
+            log.select(
+                pl.col("sampled_at"),
+                pl.col(util_col).alias("util"),
+                pl.col(reset_col).alias("reset_id"),
+            )
+            .drop_nulls(["sampled_at", "util"])
+            .sort("sampled_at")
+        )
+        if lg.height < 2:
+            return pl.DataFrame(schema=per_sess_schema), 0.0
+        lg = lg.with_columns(
+            pl.col("sampled_at").shift(1).alias("start_ts"),
+            pl.col("util").shift(1).alias("prev_util"),
+            pl.col("reset_id").shift(1).alias("prev_reset"),
+        ).with_columns((pl.col("util") - pl.col("prev_util")).alias("delta"))
+        intervals = (
+            lg.filter(
+                pl.col("start_ts").is_not_null()
+                & (pl.col("reset_id") == pl.col("prev_reset"))
+                & (pl.col("delta") > 0)
+            )
+            .select(
+                pl.col("start_ts"),
+                pl.col("sampled_at").alias("end_ts"),
+                pl.col("delta"),
+            )
+            .with_row_index("interval_id")
+            .sort("end_ts")
+        )
+        if intervals.is_empty():
+            return pl.DataFrame(schema=per_sess_schema), 0.0
+
+        tokens = df.select(["ts", "session_id", "output_tokens"]).sort("ts")
+        matched = tokens.join_asof(
+            intervals, left_on="ts", right_on="end_ts", strategy="forward"
+        ).filter(
+            pl.col("start_ts").is_not_null() & (pl.col("ts") > pl.col("start_ts"))
+        )
+        totals = matched.group_by("interval_id").agg(
+            pl.col("output_tokens").sum().alias("interval_output")
+        )
+        matched = matched.join(totals, on="interval_id", how="left").filter(
+            pl.col("interval_output") > 0
+        )
+        matched = matched.with_columns(
+            (pl.col("delta") * pl.col("output_tokens") / pl.col("interval_output")).alias(
+                "attributed"
+            )
+        )
+        per_sess = matched.group_by("session_id").agg(
+            pl.col("attributed").sum().alias("attributed")
+        )
+        attributed_total = float(matched["attributed"].sum()) if not matched.is_empty() else 0.0
+        total_delta = float(intervals["delta"].sum())
+        unattributed = max(0.0, total_delta - attributed_total)
+        return per_sess, unattributed
+
+    a5, u5 = attribute("util_5h", "resets_5h_iso")
+    aw, uw = attribute("util_7d", "resets_7d_iso")
+    diagnostics["unattributed_5h"] = u5
+    diagnostics["unattributed_7d"] = uw
+
+    out = (
+        per_session
+        .join(a5.rename({"attributed": "attributed_pct_5h"}), on="session_id", how="left")
+        .join(aw.rename({"attributed": "attributed_pct_weekly"}), on="session_id", how="left")
+        .with_columns(
+            pl.col("attributed_pct_5h").fill_null(0.0),
+            pl.col("attributed_pct_weekly").fill_null(0.0),
+        )
+        .select(list(out_schema.keys()))
+    )
+    return out, diagnostics
