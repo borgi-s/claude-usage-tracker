@@ -76,3 +76,49 @@ def test_weekly_no_mask_selected_equals_total():
     ts_filter = pl.Series("ts", [r[0] for r in rows]).cast(pl.Datetime("ms", "UTC")).implode()
     real = out.filter(pl.col("ts").is_in(ts_filter)).sort("ts")
     assert real["cumulative_selected"].to_list() == real["cumulative_total"].to_list()
+
+
+def test_five_hour_cumulative_total_uses_all_rows_not_just_selected():
+    base = datetime(2026, 5, 22, 9, 0, tzinfo=timezone.utc)
+    # All within one 5h window
+    rows = [
+        (base + timedelta(minutes=0),  10.0, False, False),
+        (base + timedelta(minutes=30), 20.0, False, True),
+        (base + timedelta(minutes=60), 30.0, False, True),
+    ]
+    df = _build_weekly_df(rows)  # same schema works
+    out = metrics.five_hour_burn_since_reset(
+        df, value_col="value", selected_mask_col="is_selected",
+    )
+    ts_filter = pl.Series("ts", [r[0] for r in rows]).cast(pl.Datetime("ms", "UTC")).implode()
+    real_rows = out.filter(pl.col("ts").is_in(ts_filter)).sort("ts")
+    assert real_rows["cumulative_total"].to_list() == [10.0, 30.0, 60.0]
+    assert real_rows["cumulative_selected"].to_list() == [0.0, 20.0, 50.0]
+
+
+def test_five_hour_cumulative_anchor_survives_view_cropping():
+    base = datetime(2026, 5, 22, 9, 0, tzinfo=timezone.utc)
+    rows = [
+        (base + timedelta(minutes=0),   100.0, False, True),
+        (base + timedelta(minutes=60),  200.0, False, True),
+        (base + timedelta(minutes=120), 300.0, False, True),
+    ]
+    df = _build_weekly_df(rows)
+    full = metrics.five_hour_burn_since_reset(df, value_col="value", selected_mask_col="is_selected")
+    cropped = full.filter(pl.col("ts") >= base + timedelta(minutes=120))
+    last_row = cropped.filter(pl.col("ts") == rows[2][0])
+    assert last_row["cumulative_total"].item() == 600.0
+
+
+def test_five_hour_no_mask_selected_equals_total():
+    """When selected_mask_col=None, cumulative_selected must equal cumulative_total."""
+    base = datetime(2026, 5, 22, 9, 0, tzinfo=timezone.utc)
+    rows = [
+        (base, 10.0, False, False),
+        (base + timedelta(minutes=30), 20.0, True, False),
+    ]
+    df = _build_weekly_df(rows)
+    out = metrics.five_hour_burn_since_reset(df, value_col="value", selected_mask_col=None)
+    ts_filter = pl.Series("ts", [r[0] for r in rows]).cast(pl.Datetime("ms", "UTC")).implode()
+    real = out.filter(pl.col("ts").is_in(ts_filter)).sort("ts")
+    assert real["cumulative_selected"].to_list() == real["cumulative_total"].to_list()

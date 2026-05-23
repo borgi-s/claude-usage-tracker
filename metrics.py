@@ -267,14 +267,15 @@ def five_hour_burn_since_reset(
     df: pl.DataFrame,
     gap_hours: float | None = None,
     value_col: str = "cost_weighted_tokens",
+    selected_mask_col: str | None = None,
 ) -> pl.DataFrame:
-    """Cumulative cost-weighted burn within each fixed 5h window.
+    """Cumulative burn within each fixed 5h window.
 
     A new window opens at the first activity satisfying either:
       - elapsed >= gap_hours since the previous activity, OR
       - elapsed >= gap_hours since the current window's start (window expired)
 
-    Returns ts, cumulative_total, cumulative_main, cumulative_sub with:
+    Returns ts, cumulative_total, cumulative_selected, cumulative_main, cumulative_sub with:
       - reset marker at each window_start (cum=0)
       - end-of-window drop at window_start + gap_hours when there is a gap
         before the next window opens (cum=0)
@@ -282,6 +283,7 @@ def five_hour_burn_since_reset(
     schema = {
         "ts": pl.Datetime("ms", "UTC"),
         "cumulative_total": pl.Float64,
+        "cumulative_selected": pl.Float64,
         "cumulative_main": pl.Float64,
         "cumulative_sub": pl.Float64,
     }
@@ -290,10 +292,14 @@ def five_hour_burn_since_reset(
 
     if gap_hours is None:
         gap_hours = config.FIVE_HOUR_WINDOW_HOURS
-    sorted_df = df.sort("ts").select(["ts", value_col, "is_subagent"])
+
+    cols = ["ts", value_col, "is_subagent"]
+    if selected_mask_col:
+        cols.append(selected_mask_col)
+    sorted_df = df.sort("ts").select(cols)
+
     ts_list = sorted_df["ts"].to_list()
     gap = timedelta(hours=gap_hours)
-
     window_starts: list = []
     current_start = None
     last_ts = None
@@ -305,21 +311,30 @@ def five_hour_burn_since_reset(
         window_starts.append(current_start)
         last_ts = ts
 
+    selected = pl.col(selected_mask_col) if selected_mask_col else pl.lit(True)
+
     work = sorted_df.with_columns(
         pl.Series("window_start", window_starts, dtype=pl.Datetime("ms", "UTC"))
     ).with_columns(
         pl.col(value_col).cum_sum().over("window_start").alias("cumulative_total"),
-        pl.when(pl.col("is_subagent")).then(0.0)
-          .otherwise(pl.col(value_col))
+        pl.when(selected).then(pl.col(value_col)).otherwise(0.0)
+          .cum_sum().over("window_start").alias("cumulative_selected"),
+        pl.when(selected & ~pl.col("is_subagent")).then(pl.col(value_col)).otherwise(0.0)
           .cum_sum().over("window_start").alias("cumulative_main"),
-        pl.when(pl.col("is_subagent")).then(pl.col(value_col))
-          .otherwise(0.0)
+        pl.when(selected & pl.col("is_subagent")).then(pl.col(value_col)).otherwise(0.0)
           .cum_sum().over("window_start").alias("cumulative_sub"),
     )
 
     unique_ws = sorted(set(window_starts))
-    reset_rows = [{"ts": ws, "cumulative_total": 0.0, "cumulative_main": 0.0, "cumulative_sub": 0.0}
-                  for ws in unique_ws]
+    _1ms = timedelta(milliseconds=1)
+    reset_rows = [
+        {
+            "ts": ws - _1ms,
+            "cumulative_total": 0.0, "cumulative_selected": 0.0,
+            "cumulative_main": 0.0, "cumulative_sub": 0.0,
+        }
+        for ws in unique_ws
+    ]
     end_drop_rows = []
     for i, ws in enumerate(unique_ws):
         window_end = ws + gap
@@ -327,14 +342,19 @@ def five_hour_burn_since_reset(
         if next_ws is None or next_ws > window_end:
             end_drop_rows.append({
                 "ts": window_end,
-                "cumulative_total": 0.0,
-                "cumulative_main": 0.0,
-                "cumulative_sub": 0.0,
+                "cumulative_total": 0.0, "cumulative_selected": 0.0,
+                "cumulative_main": 0.0, "cumulative_sub": 0.0,
             })
 
     extras = pl.DataFrame(reset_rows + end_drop_rows, schema=schema)
     return pl.concat(
-        [work.select(["ts", "cumulative_total", "cumulative_main", "cumulative_sub"]), extras],
+        [
+            work.select([
+                "ts", "cumulative_total", "cumulative_selected",
+                "cumulative_main", "cumulative_sub",
+            ]),
+            extras,
+        ],
         how="diagonal",
     ).sort("ts")
 
