@@ -52,13 +52,19 @@ _redirect_paths_to_data_dir()
 def refresh_data_panel():
     client, bucket = _client()
     try:
-        supabase_sync.download_files(client, bucket, FILE_NAMES, target_dir=DATA_DIR)
         mtime = supabase_sync.last_modified_at(client, bucket, "cache.parquet")
+        mtime_key = mtime.isoformat() if mtime else None
+        # Only re-download (and invalidate the chart cache) when the agent has
+        # actually written new data. Skipping the download on no-op polls keeps
+        # the fragment's stale-fade brief.
+        if mtime_key != st.session_state.get("last_cache_mtime"):
+            supabase_sync.download_files(client, bucket, FILE_NAMES, target_dir=DATA_DIR)
+            st.session_state["last_cache_mtime"] = mtime_key
+            load_data.clear()
         seconds_old = None
         if mtime is not None:
             seconds_old = (datetime.now(tz=timezone.utc) - mtime).total_seconds()
         render.render_live_panel_from_cache(agent_seconds_old=seconds_old)
-        load_data.clear()
     except Exception as e:
         st.error(f"Could not fetch latest from Supabase: {e}")
 
