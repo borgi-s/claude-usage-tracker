@@ -434,3 +434,64 @@ def render_live_panel_from_cache(*, agent_seconds_old: float | None):
         if prev.max5x_weekly:
             bits.append(f"Max 5x weekly cap ≈ {prev.max5x_weekly/1e6:.0f}M (Pro {prev.pro_weekly/1e6:.0f}M)")
         st.caption("Calibrated · " + " · ".join(bits))
+
+
+def render_cost_vs_session_length(df: pl.DataFrame, log: pl.DataFrame) -> None:
+    """Binned mean+std of each session's attributed cap-% vs session size.
+
+    df must be the derived cache (with `ts`); see the render-helper data-prep
+    convention. log is calibration_log.load_log().
+    """
+    st.subheader("Cost vs session length")
+    st.caption(
+        "Each session's measured share of the cap — attributed from real API % "
+        "deltas, split by output-token share — vs how big the session was. "
+        "An upward bend means longer sessions burn disproportionately more."
+    )
+    if df.is_empty():
+        st.info("No session data yet.")
+        return
+    sessions, diag = metrics.session_cost_attribution(df, log)
+    if sessions.is_empty():
+        st.info("Not enough calibration data to attribute cost yet.")
+        return
+
+    x_label_to_col = {
+        "Prompt tokens": "prompt_tokens",
+        "Requests (turns)": "n_requests",
+        "Raw total tokens": "raw_total_tokens",
+    }
+    ctrl_x, ctrl_bins = st.columns([2, 1])
+    x_label = ctrl_x.selectbox("X-axis", list(x_label_to_col.keys()), key="cvsl_x")
+    n_bins = ctrl_bins.slider("Bins", min_value=4, max_value=20, value=8, key="cvsl_bins")
+    x_col = x_label_to_col[x_label]
+
+    left, right = st.columns(2)
+    for col, y_col, title in (
+        (left, "attributed_pct_5h", "5h window"),
+        (right, "attributed_pct_weekly", "Weekly window"),
+    ):
+        binned = metrics.bin_sessions(sessions, x_col, y_col, n_bins)
+        fig = go.Figure()
+        if not binned.is_empty():
+            std_err = [(v * 100 if v is not None else 0.0) for v in binned["std_y"].to_list()]
+            fig.add_trace(go.Scatter(
+                x=binned["bin_median_x"].to_list(),
+                y=(binned["mean_y"] * 100).to_list(),
+                error_y=dict(type="data", array=std_err, visible=True),
+                mode="lines+markers",
+                customdata=binned["n"].to_list(),
+                hovertemplate="x=%{x:.0f}<br>mean=%{y:.2f}%<br>n=%{customdata}<extra></extra>",
+                line=dict(color="#4f8cff"),
+            ))
+        fig.update_layout(
+            title=title, height=350, margin=dict(t=40, b=20, l=10, r=10),
+            xaxis_title=x_label, yaxis_title="% of cap consumed (attributed)",
+        )
+        col.plotly_chart(fig, width="stretch", key=f"cvsl_{y_col}")
+
+    st.caption(
+        f"Unattributed burn (API % with no matching logged turn): "
+        f"5h {diag['unattributed_5h'] * 100:.1f}%, "
+        f"weekly {diag['unattributed_7d'] * 100:.1f}% (cumulative across all windows)."
+    )

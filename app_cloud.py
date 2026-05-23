@@ -201,6 +201,7 @@ render.render_weekly_chart(
 )
 daily = metrics.daily_stacked(fdf)
 render.render_daily_bar(daily)
+render.render_cost_vs_session_length(df, calib_log_global)
 
 sessions_with_dur = sessions.with_columns(
     ((pl.col("end") - pl.col("start")).dt.total_milliseconds() / 1000.0).alias("duration_s")
