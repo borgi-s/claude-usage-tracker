@@ -15,6 +15,67 @@ import config
 import metrics
 
 
+def _rangeselector_xaxis() -> dict:
+    """Plotly xaxis config: Yahoo-style range buttons + no rangeslider."""
+    return dict(
+        rangeselector=dict(
+            buttons=[
+                dict(count=1,  label="1D",  step="day",   stepmode="backward"),
+                dict(count=5,  label="5D",  step="day",   stepmode="backward"),
+                dict(count=14, label="14D", step="day",   stepmode="backward"),
+                dict(count=1,  label="1M",  step="month", stepmode="backward"),
+                dict(step="all", label="All"),
+            ],
+            x=0, y=1.15,
+        ),
+        rangeslider=dict(visible=False),
+        type="date",
+    )
+
+
+def _add_cumulative_traces(fig: go.Figure, df: pl.DataFrame, decomposition: str) -> None:
+    """Two render modes for the cumulative chart:
+       - 'project share': total grey line + selected filled area
+       - 'main vs sub':   stacked main + sub area (matches legacy behavior)
+    """
+    ts = df["ts"].to_list()
+    if decomposition == "main vs sub":
+        y_main = (df["cumulative_main"] * 100).to_list()
+        y_sub = (df["cumulative_sub"] * 100).to_list()
+        fig.add_trace(go.Scatter(
+            x=ts, y=y_main, mode="lines", name="main thread",
+            stackgroup="one", line=dict(width=0.5, color="#4f8cff", shape="hv"),
+        ))
+        fig.add_trace(go.Scatter(
+            x=ts, y=y_sub, mode="lines", name="subagents",
+            stackgroup="one", line=dict(width=0.5, color="#ff8a4f", shape="hv"),
+        ))
+    else:  # 'project share'
+        y_total = (df["cumulative_total"] * 100).to_list()
+        y_selected = (df["cumulative_selected"] * 100).to_list()
+        fig.add_trace(go.Scatter(
+            x=ts, y=y_selected, mode="lines", name="selected projects",
+            fill="tozeroy", line=dict(width=0.5, color="#4f8cff", shape="hv"),
+        ))
+        fig.add_trace(go.Scatter(
+            x=ts, y=y_total, mode="lines", name="all projects (total)",
+            line=dict(width=1.2, color="#888888", shape="hv"),
+        ))
+
+
+def _peak_for_decomposition(df: pl.DataFrame, decomposition: str) -> float:
+    if df.is_empty():
+        return 0.0
+    if decomposition == "main vs sub":
+        return float(
+            max((m + s) for m, s in zip(
+                df["cumulative_main"].to_list(),
+                df["cumulative_sub"].to_list(),
+            ))
+        ) * 100.0
+    return float(df["cumulative_total"].max() or 0.0) * 100.0
+
+
 def short_project(cwd: str) -> str:
     if not cwd:
         return "(unknown)"
@@ -71,7 +132,8 @@ def render_kpis(
 def render_5h_chart(
     five_h: pl.DataFrame, effective_5h_hours: float,
     n_observed_resets: int, n_anchor_5h: int, effective_cap_5h: float,
-    show_max5x: bool, start_ts: datetime, end_ts: datetime,
+    show_max5x: bool, data_start_ts: datetime, data_end_ts: datetime,
+    decomposition_key: str,
 ):
     hours_int = int(effective_5h_hours)
     minutes_int = int(round((effective_5h_hours - hours_int) * 60))
@@ -89,38 +151,37 @@ def render_5h_chart(
     st.caption(f"Y-axis: cumulative output tokens / cap. Cap = median across 100% anchor moments of "
                f"(output_tokens_in_window / util). {cap_label}.")
 
-    y5_main = (five_h["cumulative_main"] * 100).to_list()
-    y5_sub = (five_h["cumulative_sub"] * 100).to_list()
-    y5_peak = max((m + s) for m, s in zip(y5_main, y5_sub)) if y5_main else 0.0
+    decomposition = st.radio(
+        "Decomposition", ["project share", "main vs sub"],
+        index=0, horizontal=True, key=f"decomp_5h_{decomposition_key}",
+    )
 
+    five_h_ds = metrics.downsample_cumulative(five_h)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=five_h["ts"].to_list(), y=y5_main,
-        mode="lines", name="main thread", stackgroup="one",
-        line=dict(width=0.5, color="#4f8cff", shape="hv"),
-    ))
-    fig.add_trace(go.Scatter(
-        x=five_h["ts"].to_list(), y=y5_sub,
-        mode="lines", name="subagents", stackgroup="one",
-        line=dict(width=0.5, color="#ff8a4f", shape="hv"),
-    ))
-    if 20.0 <= y5_peak * 1.05:
+    _add_cumulative_traces(fig, five_h_ds, decomposition)
+
+    y_peak = _peak_for_decomposition(five_h_ds, decomposition)
+    if 20.0 <= y_peak * 1.05:
         fig.add_hline(y=20.0, line_dash="dash", line_color="red",
                       annotation_text="Pro 5h cap (20%)", annotation_position="top left")
-    if show_max5x and 100.0 <= y5_peak * 1.05:
+    if show_max5x and 100.0 <= y_peak * 1.05:
         fig.add_hline(y=100.0, line_dash="dot", line_color="orange",
                       annotation_text="Max 5x 5h cap (100%)", annotation_position="top left")
-    add_calendar_bands(fig, start_ts, end_ts)
-    fig.update_layout(height=350, margin=dict(t=20, b=20, l=10, r=10),
-                      yaxis_title="% of Max 5x 5h cap", yaxis_ticksuffix="%",
-                      yaxis_range=[0, max(y5_peak * 1.05, 1.0)],
-                      legend=dict(orientation="h"))
+    add_calendar_bands(fig, data_start_ts, data_end_ts)
+    fig.update_layout(
+        height=350, margin=dict(t=60, b=20, l=10, r=10),
+        yaxis_title="% of Max 5x 5h cap", yaxis_ticksuffix="%",
+        yaxis=dict(autorange=True),
+        xaxis=_rangeselector_xaxis(),
+        legend=dict(orientation="h"),
+    )
     st.plotly_chart(fig, width="stretch")
 
 
 def render_weekly_chart(
     weekly: pl.DataFrame, n_anchor_week: int, effective_cap_week: float,
-    show_max5x: bool, start_ts: datetime, end_ts: datetime,
+    show_max5x: bool, data_start_ts: datetime, data_end_ts: datetime,
+    decomposition_key: str,
 ):
     weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     reset_label = f"{weekday_names[config.WEEKLY_RESET_WEEKDAY]} {config.WEEKLY_RESET_HOUR_LOCAL:02d}:00 {config.LOCAL_TZ}"
@@ -132,32 +193,30 @@ def render_weekly_chart(
     st.caption(f"Sum of per-message output-token share-of-cap, cap = {effective_cap_week/1e6:.0f}M output "
                f"tokens ({cap_label_w}). Monotonically non-decreasing. Sawtooth drops to 0 at each reset.")
 
-    y7_main = (weekly["cumulative_main"] * 100).to_list()
-    y7_sub = (weekly["cumulative_sub"] * 100).to_list()
-    y7_peak = max((m + s) for m, s in zip(y7_main, y7_sub)) if y7_main else 0.0
+    decomposition = st.radio(
+        "Decomposition", ["project share", "main vs sub"],
+        index=0, horizontal=True, key=f"decomp_weekly_{decomposition_key}",
+    )
 
+    weekly_ds = metrics.downsample_cumulative(weekly)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=weekly["ts"].to_list(), y=y7_main,
-        mode="lines", name="main thread", stackgroup="one",
-        line=dict(width=0.5, color="#4f8cff", shape="hv"),
-    ))
-    fig.add_trace(go.Scatter(
-        x=weekly["ts"].to_list(), y=y7_sub,
-        mode="lines", name="subagents", stackgroup="one",
-        line=dict(width=0.5, color="#ff8a4f", shape="hv"),
-    ))
-    if 20.0 <= y7_peak * 1.05:
+    _add_cumulative_traces(fig, weekly_ds, decomposition)
+
+    y_peak = _peak_for_decomposition(weekly_ds, decomposition)
+    if 20.0 <= y_peak * 1.05:
         fig.add_hline(y=20.0, line_dash="dash", line_color="red",
                       annotation_text="Pro weekly cap (20%)", annotation_position="top left")
-    if show_max5x and 100.0 <= y7_peak * 1.05:
+    if show_max5x and 100.0 <= y_peak * 1.05:
         fig.add_hline(y=100.0, line_dash="dot", line_color="orange",
                       annotation_text="Max 5x weekly cap (100%)", annotation_position="top left")
-    add_calendar_bands(fig, start_ts, end_ts)
-    fig.update_layout(height=350, margin=dict(t=20, b=20, l=10, r=10),
-                      yaxis_title="% of Max 5x weekly cap", yaxis_ticksuffix="%",
-                      yaxis_range=[0, max(y7_peak * 1.05, 1.0)],
-                      legend=dict(orientation="h"))
+    add_calendar_bands(fig, data_start_ts, data_end_ts)
+    fig.update_layout(
+        height=350, margin=dict(t=60, b=20, l=10, r=10),
+        yaxis_title="% of Max 5x weekly cap", yaxis_ticksuffix="%",
+        yaxis=dict(autorange=True),
+        xaxis=_rangeselector_xaxis(),
+        legend=dict(orientation="h"),
+    )
     st.plotly_chart(fig, width="stretch")
 
 
@@ -168,8 +227,13 @@ def render_daily_bar(daily: pl.DataFrame):
                          name="main thread", marker_color="#4f8cff"))
     fig.add_trace(go.Bar(x=daily["date"].to_list(), y=daily["subagent"].to_list(),
                          name="subagents", marker_color="#ff8a4f"))
-    fig.update_layout(barmode="stack", height=300, margin=dict(t=20, b=20, l=10, r=10),
-                      yaxis_title="cost-weighted tokens", legend=dict(orientation="h"))
+    fig.update_layout(
+        barmode="stack", height=300, margin=dict(t=60, b=20, l=10, r=10),
+        yaxis_title="cost-weighted tokens",
+        yaxis=dict(autorange=True),
+        xaxis=_rangeselector_xaxis(),
+        legend=dict(orientation="h"),
+    )
     st.plotly_chart(fig, width="stretch")
 
 
