@@ -91,7 +91,11 @@ def test_five_hour_cumulative_total_uses_all_rows_not_just_selected():
         df, value_col="value", selected_mask_col="is_selected",
     )
     ts_filter = pl.Series("ts", [r[0] for r in rows]).cast(pl.Datetime("ms", "UTC")).implode()
-    real_rows = out.filter(pl.col("ts").is_in(ts_filter)).sort("ts")
+    # Exclude reset rows: when window_start equals a real data row's ts, the reset row
+    # collides on the same timestamp. Reset rows always have cumulative_total == 0.
+    real_rows = out.filter(
+        pl.col("ts").is_in(ts_filter) & (pl.col("cumulative_total") != 0)
+    ).sort("ts")
     assert real_rows["cumulative_total"].to_list() == [10.0, 30.0, 60.0]
     assert real_rows["cumulative_selected"].to_list() == [0.0, 20.0, 50.0]
 
@@ -120,5 +124,9 @@ def test_five_hour_no_mask_selected_equals_total():
     df = _build_weekly_df(rows)
     out = metrics.five_hour_burn_since_reset(df, value_col="value", selected_mask_col=None)
     ts_filter = pl.Series("ts", [r[0] for r in rows]).cast(pl.Datetime("ms", "UTC")).implode()
-    real = out.filter(pl.col("ts").is_in(ts_filter)).sort("ts")
+    # Exclude reset rows: when window_start equals a real data row's ts, the reset row
+    # collides on the same timestamp. Reset rows always have cumulative_total == 0.
+    real = out.filter(
+        pl.col("ts").is_in(ts_filter) & (pl.col("cumulative_total") != 0)
+    ).sort("ts")
     assert real["cumulative_selected"].to_list() == real["cumulative_total"].to_list()

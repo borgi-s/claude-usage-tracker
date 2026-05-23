@@ -326,10 +326,9 @@ def five_hour_burn_since_reset(
     )
 
     unique_ws = sorted(set(window_starts))
-    _1ms = timedelta(milliseconds=1)
     reset_rows = [
         {
-            "ts": ws - _1ms,
+            "ts": ws,
             "cumulative_total": 0.0, "cumulative_selected": 0.0,
             "cumulative_main": 0.0, "cumulative_sub": 0.0,
         }
