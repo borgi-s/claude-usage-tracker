@@ -91,7 +91,7 @@ def _render_usage_view(
         st.caption(prefix + f" · sub `{sub_type}` tier `{rate_limit_tier}`  ·  utilization too low to derive caps yet.")
 
 
-@st.fragment(run_every=60)
+@st.fragment(run_every=300)
 def live_usage_panel():
     st.subheader("Live plan usage")
     # Keep the chart data fresh: incremental disk reparse + force full app
@@ -381,6 +381,10 @@ render.render_weekly_chart(
 # ---------- Chart 3: Daily stacked ----------
 daily = metrics.daily_stacked(fdf)
 render.render_daily_bar(daily)
+
+
+# ---------- Chart 4: Cost vs session length ----------
+render.render_cost_vs_session_length(df, calib_log_global)
 
 
 # ---------- Session aggregation for summary table ----------

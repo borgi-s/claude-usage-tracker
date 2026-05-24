@@ -1,7 +1,7 @@
 """Read-only cloud viewer for the Claude usage tracker.
 
 Deployed on Streamlit Community Cloud. Downloads data files from Supabase
-Storage every 60 seconds and renders the same charts as the local app, minus
+Storage every 5 minutes and renders the same charts as the local app, minus
 calibration and refresh controls.
 """
 from __future__ import annotations
@@ -48,7 +48,7 @@ def _redirect_paths_to_data_dir():
 _redirect_paths_to_data_dir()
 
 
-@st.fragment(run_every=60)
+@st.fragment(run_every=300)
 def refresh_data_panel():
     client, bucket = _client()
     try:
@@ -76,7 +76,7 @@ def load_data():
 
 
 st.title("Claude usage tracker")
-st.caption("Read-only cloud view · refreshes every 60s · data flows from your Windows agent → Supabase → here.")
+st.caption("Read-only cloud view · refreshes every 5 min · data flows from your Windows agent → Supabase → here.")
 
 refresh_data_panel()
 
@@ -201,6 +201,7 @@ render.render_weekly_chart(
 )
 daily = metrics.daily_stacked(fdf)
 render.render_daily_bar(daily)
+render.render_cost_vs_session_length(df, calib_log_global)
 
 sessions_with_dur = sessions.with_columns(
     ((pl.col("end") - pl.col("start")).dt.total_milliseconds() / 1000.0).alias("duration_s")

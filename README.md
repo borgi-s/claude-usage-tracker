@@ -2,12 +2,12 @@
 
 Two-piece dashboard for monitoring Claude Code token usage against subscription caps.
 
-- **Local agent** (`app.py`) — runs on the machine that has your Claude Code data. Reads JSONL transcripts, polls Anthropic's `oauth/usage` endpoint, continuously calibrates the Max-5x cap against your own 100% utilization moments, syncs three small data files to Supabase Storage every 60s.
-- **Cloud viewer** (`app_cloud.py`) — read-only Streamlit app deployed on Streamlit Community Cloud. Downloads from Supabase every 60s, renders the same charts. Phone-accessible.
+- **Local agent** (`app.py`) — runs on the machine that has your Claude Code data. Reads JSONL transcripts, polls Anthropic's `oauth/usage` endpoint, continuously calibrates the Max-5x cap against your own 100% utilization moments, syncs three small data files to Supabase Storage every 5 minutes.
+- **Cloud viewer** (`app_cloud.py`) — read-only Streamlit app deployed on Streamlit Community Cloud. Downloads from Supabase every 5 minutes, renders the same charts. Phone-accessible.
 
 ## Calibration model in one paragraph
 
-Each row of your local JSONL is cost-weighted (`input=1, cache_write=1.25, cache_read=0.1, output=5`). The live panel polls Anthropic every 60s and stores `(util, burn_in_window, resets_at)` in `calibration_log.parquet`. The 5h cap is the **median across ≥95% utilization anchors of `burn_in_chart_window / util`** — meaning the chart's cumulative at every 100% anchor moment equals 100% by construction. No hour-of-day adjustment (too few anchors per hour for that to be reliable). The weekly cap is computed the same way once you hit ≥95% on the weekly window. `FIVE_HOUR_WINDOW_HOURS` auto-corrects from observed resets once you have ≥5 of them in the log.
+Each row of your local JSONL is cost-weighted (`input=1, cache_write=1.25, cache_read=0.1, output=5`). The live panel polls Anthropic every 5 minutes and stores `(util, burn_in_window, resets_at)` in `calibration_log.parquet`. The 5h cap is the **median across ≥95% utilization anchors of `burn_in_chart_window / util`** — meaning the chart's cumulative at every 100% anchor moment equals 100% by construction. No hour-of-day adjustment (too few anchors per hour for that to be reliable). The weekly cap is computed the same way once you hit ≥95% on the weekly window. `FIVE_HOUR_WINDOW_HOURS` auto-corrects from observed resets once you have ≥5 of them in the log.
 
 ## Setup
 

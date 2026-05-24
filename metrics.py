@@ -619,3 +619,167 @@ def detect_compactions(main_curve: pl.DataFrame, drop_ratio: float = 0.4, min_dr
         pl.col("prompt_tokens").alias("before"),
         pl.col("next_pt").alias("after"),
     )
+
+
+def session_cost_attribution(
+    df: pl.DataFrame, log: pl.DataFrame
+) -> tuple[pl.DataFrame, dict]:
+    """Attribute each window's API utilization delta to sessions by output-token share.
+
+    Returns (sessions, diagnostics):
+      - sessions: one row per session_id with attributed_pct_5h, attributed_pct_weekly
+        (0-1 fractions), prompt_tokens, n_requests, raw_total_tokens.
+      - diagnostics: {"unattributed_5h": float, "unattributed_7d": float} — summed
+        delta (fraction) within valid same-window intervals that matched no logged turn.
+        Cross-reset and null-reset intervals are excluded entirely (not counted here).
+    """
+    out_schema = {
+        "session_id": pl.Utf8,
+        "attributed_pct_5h": pl.Float64,
+        "attributed_pct_weekly": pl.Float64,
+        "prompt_tokens": pl.Int64,
+        "n_requests": pl.Int64,
+        "raw_total_tokens": pl.Int64,
+    }
+    diagnostics = {"unattributed_5h": 0.0, "unattributed_7d": 0.0}
+    if df.is_empty():
+        return pl.DataFrame(schema=out_schema), diagnostics
+
+    per_session = df.group_by("session_id").agg(
+        pl.col("prompt_tokens").sum().cast(pl.Int64).alias("prompt_tokens"),
+        pl.col("raw_total_tokens").sum().cast(pl.Int64).alias("raw_total_tokens"),
+        (~pl.col("is_subagent")).sum().cast(pl.Int64).alias("n_requests"),
+    )
+
+    def attribute(util_col: str, reset_col: str) -> tuple[pl.DataFrame, float]:
+        per_sess_schema = {"session_id": pl.Utf8, "attributed": pl.Float64}
+        if log.is_empty() or util_col not in log.columns:
+            return pl.DataFrame(schema=per_sess_schema), 0.0
+        lg = (
+            log.select(
+                pl.col("sampled_at"),
+                pl.col(util_col).alias("util"),
+                pl.col(reset_col).alias("reset_id"),
+            )
+            .drop_nulls(["sampled_at", "util"])
+            .sort("sampled_at")
+        )
+        if lg.height < 2:
+            return pl.DataFrame(schema=per_sess_schema), 0.0
+        # resets_*_iso are ISO timestamps of the window's reset instant carrying ~1s
+        # of jitter (they are NOT stable labels). Two consecutive samples are the same
+        # window iff both reset instants parse and are within an hour of each other;
+        # genuinely distinct windows are ≥5h (5h) / 7d (weekly) apart.
+        lg = lg.with_columns(
+            pl.col("reset_id")
+            .str.to_datetime(format="%Y-%m-%dT%H:%M:%S%.f%z", strict=False)
+            .alias("win_dt"),
+        ).with_columns(
+            pl.col("sampled_at").shift(1).alias("start_ts"),
+            pl.col("util").shift(1).alias("prev_util"),
+            pl.col("win_dt").shift(1).alias("prev_win_dt"),
+        ).with_columns((pl.col("util") - pl.col("prev_util")).alias("delta"))
+        intervals = (
+            lg.filter(
+                pl.col("start_ts").is_not_null()
+                & pl.col("win_dt").is_not_null()
+                & pl.col("prev_win_dt").is_not_null()
+                & ((pl.col("win_dt") - pl.col("prev_win_dt")).dt.total_seconds().abs() <= 3600)
+                & (pl.col("delta") > 0)
+            )
+            .select(
+                pl.col("start_ts"),
+                pl.col("sampled_at").alias("end_ts"),
+                pl.col("delta"),
+            )
+            .sort("end_ts")
+            .with_row_index("interval_id")
+        )
+        if intervals.is_empty():
+            return pl.DataFrame(schema=per_sess_schema), 0.0
+
+        tokens = df.select(["ts", "session_id", "output_tokens"]).sort("ts")
+        # Half-open (start_ts, end_ts]: forward asof picks the smallest end_ts >= ts,
+        # then the ts > start_ts filter drops rows that precede the matched interval.
+        matched = tokens.join_asof(
+            intervals, left_on="ts", right_on="end_ts", strategy="forward"
+        ).filter(
+            pl.col("start_ts").is_not_null() & (pl.col("ts") > pl.col("start_ts"))
+        )
+        totals = matched.group_by("interval_id").agg(
+            pl.col("output_tokens").sum().alias("interval_output")
+        )
+        matched = matched.join(totals, on="interval_id", how="left").filter(
+            pl.col("interval_output") > 0
+        )
+        matched = matched.with_columns(
+            (pl.col("delta") * pl.col("output_tokens") / pl.col("interval_output")).alias(
+                "attributed"
+            )
+        )
+        per_sess = matched.group_by("session_id").agg(
+            pl.col("attributed").sum().alias("attributed")
+        )
+        # unattributed = within-window positive delta that matched no logged turn.
+        # (Cross-reset / null-reset intervals are excluded entirely, not counted here.)
+        attributed_total = float(matched["attributed"].sum() or 0.0)
+        total_delta = float(intervals["delta"].sum())
+        unattributed = max(0.0, total_delta - attributed_total)
+        return per_sess, unattributed
+
+    a5, u5 = attribute("util_5h", "resets_5h_iso")
+    aw, uw = attribute("util_7d", "resets_7d_iso")
+    diagnostics["unattributed_5h"] = u5
+    diagnostics["unattributed_7d"] = uw
+
+    out = (
+        per_session
+        .join(a5.rename({"attributed": "attributed_pct_5h"}), on="session_id", how="left")
+        .join(aw.rename({"attributed": "attributed_pct_weekly"}), on="session_id", how="left")
+        .with_columns(
+            pl.col("attributed_pct_5h").fill_null(0.0),
+            pl.col("attributed_pct_weekly").fill_null(0.0),
+        )
+        .select(list(out_schema.keys()))
+    )
+    return out, diagnostics
+
+
+def bin_sessions(
+    sessions: pl.DataFrame, x_col: str, y_col: str, n_bins: int
+) -> pl.DataFrame:
+    """Quantile-bin sessions on x_col (equal count per bin) and aggregate y_col.
+
+    Returns columns bin_median_x, mean_y, std_y, n, sorted by bin_median_x.
+    std_y is null for single-member bins.
+    """
+    schema = {
+        "bin_median_x": pl.Float64,
+        "mean_y": pl.Float64,
+        "std_y": pl.Float64,
+        "n": pl.Int64,
+    }
+    if sessions.is_empty() or x_col not in sessions.columns or y_col not in sessions.columns:
+        return pl.DataFrame(schema=schema)
+    s = sessions.select(
+        pl.col(x_col).cast(pl.Float64).alias("x"),
+        pl.col(y_col).cast(pl.Float64).alias("y"),
+    ).drop_nulls()
+    if s.is_empty():
+        return pl.DataFrame(schema=schema)
+    n_bins = max(1, min(n_bins, s.height))
+    s = s.with_columns(
+        (((pl.col("x").rank(method="ordinal") - 1).cast(pl.Int64) * n_bins) // pl.len())
+        .alias("bin")
+    )
+    return (
+        s.group_by("bin")
+        .agg(
+            pl.col("x").median().alias("bin_median_x"),
+            pl.col("y").mean().alias("mean_y"),
+            pl.col("y").std().alias("std_y"),
+            pl.len().cast(pl.Int64).alias("n"),
+        )
+        .sort("bin")  # bin index == ascending-x quantile order; stable under x-ties
+        .select(list(schema.keys()))
+    )
