@@ -377,6 +377,9 @@ def global_cap_from_anchors(
     output (verified empirically: two 100% anchors at the same output volume but
     very different cost-weighted volumes due to model mix). Pass a different
     column if you want to calibrate against a different aggregate.
+
+    Vectorized: single Python pass assigns window IDs to cache rows, then Polars
+    cumsum + join_asof replaces the O(anchors × cache_rows) double loop.
     """
     if log.is_empty() or cache_df.is_empty():
         return None, 0
@@ -391,58 +394,109 @@ def global_cap_from_anchors(
     if anchors.is_empty():
         return None, 0
 
-    cache_sorted = cache_df.sort("ts")
-    ts_list = cache_sorted["ts"].to_list()
-    val_list = cache_sorted[value_col].to_list()
-    gap = timedelta(hours=gap_hours)
+    cache_sorted = cache_df.sort("ts").select(["ts", value_col])
 
-    # For weekly, Anthropic's util_7d resets at WEEKLY_RESET (Sun 07:00 local by
-    # default), not rolling. We need the local tz to compute the most-recent reset.
-    tz = ZoneInfo(config.LOCAL_TZ) if kind == "weekly" else None
+    if kind == "weekly":
+        # ── Weekly path ────────────────────────────────────────────────────
+        # Add week_start to every cache row via map_elements (one pass, fast enough).
+        # Cumsum value_col within each week_start group ordered by ts.
+        # join_asof anchors → cache on ts with by="week_start" to get burn.
+        import metrics as _metrics  # local import avoids circular at module level
 
-    def _last_weekly_reset(anchor_ts_utc):
-        local = anchor_ts_utc.astimezone(tz)
-        days_back = (local.weekday() - config.WEEKLY_RESET_WEEKDAY) % 7
-        candidate = local.replace(
-            hour=config.WEEKLY_RESET_HOUR_LOCAL, minute=0, second=0, microsecond=0,
-        ) - timedelta(days=days_back)
-        if candidate > local:
-            candidate -= timedelta(days=7)
-        return candidate.astimezone(timezone.utc)
+        # Determine the time-unit of the ts column so week_start matches exactly.
+        ts_dtype = cache_sorted.schema["ts"]
 
-    implied: list[float] = []
-    for row in anchors.iter_rows(named=True):
-        anchor_ts = row["sampled_at"]
-        if anchor_ts is None:
-            continue
-        if anchor_ts.tzinfo is None:
-            anchor_ts = anchor_ts.replace(tzinfo=timezone.utc)
-        util_anth = row[util_col]
+        cache_with_ws = cache_sorted.with_columns(
+            pl.col("ts")
+            .map_elements(_metrics.week_start_for, return_dtype=pl.Datetime("us", "UTC"))
+            .cast(ts_dtype)
+            .alias("week_start")
+        ).with_columns(
+            pl.col(value_col)
+            .cum_sum()
+            .over("week_start", order_by="ts")
+            .alias("_cum_burn")
+        )
 
-        if kind == "weekly":
-            win_start = _last_weekly_reset(anchor_ts)
-            burn_in_window = sum(
-                float(v) for ts, v in zip(ts_list, val_list)
-                if win_start <= ts <= anchor_ts
+        anchors_with_ws = anchors.select(
+            [pl.col("sampled_at").alias("ts"), pl.col(util_col)]
+        ).with_columns(
+            pl.col("ts")
+            .map_elements(_metrics.week_start_for, return_dtype=pl.Datetime("us", "UTC"))
+            .cast(ts_dtype)
+            .alias("week_start")
+        ).sort("ts")
+
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore", UserWarning)
+            joined = anchors_with_ws.join_asof(
+                cache_with_ws.select(["ts", "week_start", "_cum_burn"]),
+                on="ts",
+                by="week_start",
+                strategy="backward",
             )
-        else:
-            # 5h: replicate the chart's gap-based window detection.
-            current_start = None
-            last_ts = None
-            burn_in_window = 0.0
-            for ts, v in zip(ts_list, val_list):
-                if ts > anchor_ts:
-                    break
-                if current_start is None:
-                    current_start = ts
-                elif (ts - last_ts) >= gap or (ts - current_start) >= gap:
-                    current_start = ts
-                    burn_in_window = 0.0
-                burn_in_window += float(v)
-                last_ts = ts
 
-        if burn_in_window > 0 and util_anth > 0:
-            implied.append(burn_in_window / util_anth)
+        implied = [
+            float(burn) / float(util)
+            for burn, util in zip(
+                joined["_cum_burn"].to_list(),
+                joined[util_col].to_list(),
+            )
+            if burn is not None and float(burn) > 0 and float(util) > 0
+        ]
+
+    else:
+        # ── 5h path ────────────────────────────────────────────────────────
+        # Single Python pass assigns a monotone window_id to each cache row,
+        # replicating the gap-based detection from the original double loop.
+        # Then cumsum within each window_id, join_asof without by= (the last
+        # cache row ≤ anchor_ts is always in the correct window).
+        ts_list = cache_sorted["ts"].to_list()
+        gap = timedelta(hours=gap_hours)
+
+        window_ids: list[int] = []
+        current_wid = -1
+        current_start: Optional[datetime] = None
+        last_ts: Optional[datetime] = None
+
+        for ts in ts_list:
+            if current_start is None:
+                current_wid += 1
+                current_start = ts
+            elif (ts - last_ts) >= gap or (ts - current_start) >= gap:
+                current_wid += 1
+                current_start = ts
+            window_ids.append(current_wid)
+            last_ts = ts
+
+        cache_with_wid = cache_sorted.with_columns(
+            pl.Series("_window_id", window_ids, dtype=pl.Int32)
+        ).with_columns(
+            pl.col(value_col)
+            .cum_sum()
+            .over("_window_id", order_by="ts")
+            .alias("_cum_burn")
+        )
+
+        anchors_ts = anchors.select(
+            [pl.col("sampled_at").alias("ts"), pl.col(util_col)]
+        )
+
+        joined = anchors_ts.join_asof(
+            cache_with_wid.select(["ts", "_cum_burn"]),
+            on="ts",
+            strategy="backward",
+        )
+
+        implied = [
+            float(burn) / float(util)
+            for burn, util in zip(
+                joined["_cum_burn"].to_list(),
+                joined[util_col].to_list(),
+            )
+            if burn is not None and float(burn) > 0 and float(util) > 0
+        ]
 
     if not implied:
         return None, 0
