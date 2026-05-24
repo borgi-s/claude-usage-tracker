@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+import app_cache
 import caps as caps_mod
 import calibration_log
 import config
@@ -504,7 +505,8 @@ def render_cost_vs_session_length(df: pl.DataFrame, log: pl.DataFrame) -> None:
     if df.is_empty():
         st.info("No session data yet.")
         return
-    sessions, diag = metrics.session_cost_attribution(df, log)
+    calib = app_cache.calibrate(df, log)
+    sessions, diag = calib.sessions, calib.diag
     if sessions.is_empty():
         st.info("Not enough calibration data to attribute cost yet.")
         return

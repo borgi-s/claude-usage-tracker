@@ -7,6 +7,7 @@ import polars as pl
 import streamlit as st
 
 import anthropic_client
+import app_cache
 import cache
 import calibration_log
 import caps as caps_mod
@@ -300,20 +301,18 @@ data_end_ts = df["ts"].max()
 
 # ---------- Single global cap derived from 100% anchors ----------
 calib_log_global = calibration_log.load_log()
-effective_5h_hours, n_observed_resets = metrics.effective_window_hours(
-    calib_log_global, df, default=config.FIVE_HOUR_WINDOW_HOURS, min_samples=5,
-)
+calib = app_cache.calibrate(df, calib_log_global)
+effective_5h_hours = calib.eff_hours
+n_observed_resets = calib.n_observed
 
 # Caps are calibrated against output tokens (Anthropic's actual metering signal).
 # Fallback uses a rough heuristic: Max 5x output cap ≈ 2.1M tokens/5h, weekly ≈ 100M.
 OUTPUT_CAP_5H_FALLBACK = 2_100_000.0
 OUTPUT_CAP_WEEKLY_FALLBACK = 100_000_000.0
-global_cap_5h, n_anchor_5h = caps_mod.global_cap_from_anchors(
-    calib_log_global, df, "5h", gap_hours=effective_5h_hours,
-)
-global_cap_week, n_anchor_week = caps_mod.global_cap_from_anchors(
-    calib_log_global, df, "weekly", gap_hours=24 * 7, min_util=0.10,
-)
+global_cap_5h = calib.cap_5h
+n_anchor_5h = calib.n_anchor_5h
+global_cap_week = calib.cap_weekly
+n_anchor_week = calib.n_anchor_weekly
 effective_cap_5h = global_cap_5h if global_cap_5h else OUTPUT_CAP_5H_FALLBACK
 effective_cap_week = global_cap_week if global_cap_week else OUTPUT_CAP_WEEKLY_FALLBACK
 
@@ -326,37 +325,27 @@ df_with_caps = df_with_mask.with_columns(
 # ---------- KPIs ----------
 # Lifetime KPIs (over full df, not project-filtered — represents true cap usage)
 total_cw = float(df["cost_weighted_tokens"].sum())
-sessions = metrics.session_summaries(fdf)
-five_h = metrics.five_hour_burn_since_reset(
-    df_with_caps, gap_hours=effective_5h_hours,
-    value_col="share_5h", selected_mask_col="is_selected",
+
+fc = app_cache.filtered_compute(
+    df_with_caps, fdf, selected_projects, selected_models,
+    effective_5h_hours, effective_cap_5h, effective_cap_week,
 )
-weekly = metrics.weekly_burn_since_reset(
-    df_with_caps, value_col="share_week", selected_mask_col="is_selected",
-)
+sessions = fc.sessions
+five_h = fc.five_h
+weekly = fc.weekly
+five_h_window_shares = fc.five_h_window_shares
+per_week_shares = fc.per_week_shares
+daily = fc.daily
+
 peak_5h_share = float(five_h["cumulative_total"].max() or 0)
 peak_weekly_share = float(weekly["cumulative_total"].max() or 0)
 
 span_days = max((df["ts"].max() - df["ts"].min()).total_seconds() / 86400.0, 1.0)
 daily_avg = total_cw / span_days
 
-# Per-window totals across the full df (not project-filtered) for lifetime KPI honesty
-five_h_window_shares = metrics.five_hour_window_totals(
-    df_with_caps, gap_hours=effective_5h_hours, value_col="share_5h",
-)
 windows_over_pro_5h = sum(1 for s in five_h_window_shares if s > 0.20)
 windows_total_5h = len(five_h_window_shares)
 
-per_week_shares = (
-    df_with_caps.with_columns(
-        pl.col("ts")
-        .map_elements(metrics.week_start_for, return_dtype=pl.Datetime("us", "UTC"))
-        .cast(pl.Datetime("ms", "UTC"))
-        .alias("week_start")
-    )
-    .group_by("week_start")
-    .agg(pl.col("share_week").sum().alias("week_share"))
-)
 weeks_over_pro = per_week_shares.filter(pl.col("week_share") > 0.20).height
 weeks_total = per_week_shares.height
 
@@ -379,7 +368,6 @@ render.render_weekly_chart(
 )
 
 # ---------- Chart 3: Daily stacked ----------
-daily = metrics.daily_stacked(fdf)
 render.render_daily_bar(daily)
 
 

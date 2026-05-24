@@ -189,6 +189,10 @@ def observed_window_lengths(
                      gap and lies within (resets - default_hours - 0.5h, resets)
       length       = window_end - window_start
     Lengths outside [sanity_min, sanity_max] hours are discarded.
+
+    Vectorized implementation: uses binary search (searchsorted) on a pre-sorted
+    ts array to avoid a per-reset full-cache filter, giving O(R log N) instead
+    of O(R*N) where R = number of resets and N = cache rows.
     """
     if log.is_empty() or "resets_5h_iso" not in log.columns or cache_df.is_empty():
         return []
@@ -200,7 +204,36 @@ def observed_window_lengths(
     if unique_resets.is_empty():
         return []
 
+    # Pre-sort the cache ts array once; use searchsorted for O(log N) lookups.
     cache_sorted = cache_df.sort("ts")
+    ts_array = cache_sorted["ts"].to_list()  # list of datetime objects
+    n = len(ts_array)
+
+    def _searchsorted_left(arr: list, val) -> int:
+        """Return leftmost index i such that arr[i] >= val (Python bisect_left)."""
+        lo, hi = 0, len(arr)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if arr[mid] < val:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    def _searchsorted_right(arr: list, val) -> int:
+        """Return rightmost index i such that arr[i] <= val (Python bisect_right - 1)."""
+        lo, hi = 0, len(arr)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if arr[mid] <= val:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo - 1  # last index where arr[i] <= val (-1 if none)
+
+    lookback_delta = timedelta(hours=default_hours + 0.5)
+    gap_threshold = timedelta(hours=default_hours * 0.8)
+
     lengths: list[float] = []
     for reset_iso in unique_resets["resets_5h_iso"].to_list():
         try:
@@ -210,20 +243,25 @@ def observed_window_lengths(
         if reset_dt.tzinfo is None:
             reset_dt = reset_dt.replace(tzinfo=timezone.utc)
 
-        window_start_floor = reset_dt - timedelta(hours=default_hours + 0.5)
-        in_window = cache_sorted.filter(
-            (pl.col("ts") >= window_start_floor) & (pl.col("ts") <= reset_dt)
-        )
-        if in_window.is_empty():
-            continue
-        first_activity = in_window["ts"].min()
+        window_start_floor = reset_dt - lookback_delta
 
-        # Confirm there's a gap of at least 0.8 * default_hours before first_activity
-        before = cache_sorted.filter(pl.col("ts") < first_activity)
-        if not before.is_empty():
-            prev_activity = before["ts"].max()
-            gap = (first_activity - prev_activity).total_seconds() / 3600.0
-            if gap < default_hours * 0.8:
+        # Find range [lo, hi] in ts_array where floor <= ts <= reset_dt
+        lo = _searchsorted_left(ts_array, window_start_floor)
+        hi_idx = _searchsorted_right(ts_array, reset_dt)
+        if lo > hi_idx or lo >= n:
+            continue
+
+        first_activity = ts_array[lo]  # smallest ts >= floor (and <= reset_dt)
+
+        # Confirm gap: find the latest ts strictly before first_activity
+        prev_idx = lo - 1  # ts_array is sorted; element just before lo is < window_start_floor
+        # But we need the largest ts strictly < first_activity anywhere in cache.
+        # Since ts_array is sorted and lo = leftmost index >= floor, ts_array[lo-1] < floor
+        # which is < first_activity, so ts_array[lo-1] is the immediate predecessor.
+        if prev_idx >= 0:
+            prev_activity = ts_array[prev_idx]
+            gap = first_activity - prev_activity
+            if gap < gap_threshold:
                 continue
 
         length = (reset_dt - first_activity).total_seconds() / 3600.0
@@ -392,6 +430,21 @@ def five_hour_window_totals(
     return totals
 
 
+def _build_week_boundaries(min_ts: datetime, max_ts: datetime) -> list[datetime]:
+    """Return sorted list of all weekly-reset boundary instants in [min_ts, max_ts+1week].
+
+    Calls week_start_for only O(weeks) times (dozens), not once per row.
+    Each boundary is DST-correct because week_start_for handles DST arithmetic.
+    """
+    boundaries: list[datetime] = []
+    current = week_start_for(min_ts)
+    while current <= max_ts:
+        boundaries.append(current)
+        # Step +8 days to land firmly in the next week regardless of DST transitions.
+        current = week_start_for(current + timedelta(days=8))
+    return boundaries
+
+
 def weekly_burn_since_reset(
     df: pl.DataFrame,
     value_col: str = "cost_weighted_tokens",
@@ -406,6 +459,10 @@ def weekly_burn_since_reset(
     - cumulative_sub:  sum over selected rows that ARE subagents
 
     Inserts a zero-valued reset row at each week boundary for clean sawtooth rendering.
+
+    Vectorized implementation: generates the ~N_weeks boundary instants via scalar
+    week_start_for (DST-safe), then assigns each cache row its week_start via
+    join_asof(..., strategy="backward") — replacing the old per-row map_elements.
     """
     schema = {
         "ts": pl.Datetime("ms", "UTC"),
@@ -419,23 +476,43 @@ def weekly_burn_since_reset(
 
     selected = pl.col(selected_mask_col) if selected_mask_col else pl.lit(True)
 
-    work = (
+    sorted_df = (
         df.select(["ts", value_col, "is_subagent"] + ([selected_mask_col] if selected_mask_col else []))
         .sort("ts")
-        .with_columns(
-            pl.col("ts")
-            .map_elements(week_start_for, return_dtype=pl.Datetime("us", "UTC"))
-            .cast(pl.Datetime("ms", "UTC"))
-            .alias("week_start"),
-        )
     )
+
+    # Build boundary list covering [min_ts, max_ts] using only O(weeks) scalar calls.
+    min_ts = sorted_df["ts"].min()
+    max_ts = sorted_df["ts"].max()
+    # Convert Polars datetime values to Python datetime if needed.
+    if not isinstance(min_ts, datetime):
+        min_ts = min_ts.to_pydatetime()  # type: ignore[union-attr]
+    if not isinstance(max_ts, datetime):
+        max_ts = max_ts.to_pydatetime()  # type: ignore[union-attr]
+
+    boundaries = _build_week_boundaries(min_ts, max_ts)  # type: ignore[arg-type]
+
+    boundaries_df = pl.DataFrame(
+        {"week_start": boundaries},
+        schema={"week_start": pl.Datetime("ms", "UTC")},
+    )
+
+    # join_asof(strategy="backward"): for each row in sorted_df, find the largest
+    # boundary <= ts.  This is by definition week_start_for(ts).
+    work = sorted_df.join_asof(
+        boundaries_df,
+        left_on="ts",
+        right_on="week_start",
+        strategy="backward",
+    )
+
     work = work.with_columns(
-        pl.col(value_col).cum_sum().over("week_start").alias("cumulative_total"),
-        pl.when(selected).then(pl.col(value_col)).otherwise(0.0)
+        pl.col(value_col).cast(pl.Float64).cum_sum().over("week_start").alias("cumulative_total"),
+        pl.when(selected).then(pl.col(value_col).cast(pl.Float64)).otherwise(0.0)
           .cum_sum().over("week_start").alias("cumulative_selected"),
-        pl.when(selected & ~pl.col("is_subagent")).then(pl.col(value_col)).otherwise(0.0)
+        pl.when(selected & ~pl.col("is_subagent")).then(pl.col(value_col).cast(pl.Float64)).otherwise(0.0)
           .cum_sum().over("week_start").alias("cumulative_main"),
-        pl.when(selected & pl.col("is_subagent")).then(pl.col(value_col)).otherwise(0.0)
+        pl.when(selected & pl.col("is_subagent")).then(pl.col(value_col).cast(pl.Float64)).otherwise(0.0)
           .cum_sum().over("week_start").alias("cumulative_sub"),
     )
 

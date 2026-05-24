@@ -20,16 +20,22 @@ def upload_files(client, bucket: str, files: Iterable[Path]) -> None:
         )
 
 
-def download_files(client, bucket: str, names: Iterable[str], target_dir: Path) -> None:
+def download_files(
+    client, bucket: str, names: Iterable[str], target_dir: Path, prefix: str = ""
+) -> None:
+    """Download each `name` to `target_dir/name`. When `prefix` is set, the
+    remote object key is `prefix/name` (the per-user folder the Rust agent writes
+    to); the local filename stays bare so existing config paths still resolve."""
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     for name in names:
-        data = client.storage.from_(bucket).download(name)
+        remote = f"{prefix}/{name}" if prefix else name
+        data = client.storage.from_(bucket).download(remote)
         (target_dir / name).write_bytes(data)
 
 
-def last_modified_at(client, bucket: str, name: str) -> datetime | None:
-    items = client.storage.from_(bucket).list(path="")
+def last_modified_at(client, bucket: str, name: str, prefix: str = "") -> datetime | None:
+    items = client.storage.from_(bucket).list(path=prefix)
     for it in items:
         if it.get("name") == name:
             raw = it.get("updated_at")
