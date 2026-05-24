@@ -26,6 +26,9 @@ st.set_page_config(page_title="Claude usage tracker — cloud", layout="wide")
 
 DATA_DIR = Path(os.environ.get("CLOUD_DATA_DIR", "/tmp/usage-tracker"))
 FILE_NAMES = ["cache.parquet", "caps.json", "calibration_log.parquet"]
+# Per-user folder in the bucket (the Rust agent's SUPABASE_USER_PREFIX). Empty =
+# read from bucket root, matching the legacy Python agent's upload location.
+USER_PREFIX = os.environ.get("CLOUD_USER_PREFIX", "").strip("/")
 
 
 @st.cache_resource
@@ -52,13 +55,13 @@ _redirect_paths_to_data_dir()
 def refresh_data_panel():
     client, bucket = _client()
     try:
-        mtime = supabase_sync.last_modified_at(client, bucket, "cache.parquet")
+        mtime = supabase_sync.last_modified_at(client, bucket, "cache.parquet", prefix=USER_PREFIX)
         mtime_key = mtime.isoformat() if mtime else None
         # Only re-download (and invalidate the chart cache) when the agent has
         # actually written new data. Skipping the download on no-op polls keeps
         # the fragment's stale-fade brief.
         if mtime_key != st.session_state.get("last_cache_mtime"):
-            supabase_sync.download_files(client, bucket, FILE_NAMES, target_dir=DATA_DIR)
+            supabase_sync.download_files(client, bucket, FILE_NAMES, target_dir=DATA_DIR, prefix=USER_PREFIX)
             st.session_state["last_cache_mtime"] = mtime_key
             load_data.clear()
         seconds_old = None
