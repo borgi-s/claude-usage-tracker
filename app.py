@@ -7,6 +7,7 @@ import polars as pl
 import streamlit as st
 
 import anthropic_client
+import app_cache
 import cache
 import calibration_log
 import caps as caps_mod
@@ -300,20 +301,18 @@ data_end_ts = df["ts"].max()
 
 # ---------- Single global cap derived from 100% anchors ----------
 calib_log_global = calibration_log.load_log()
-effective_5h_hours, n_observed_resets = metrics.effective_window_hours(
-    calib_log_global, df, default=config.FIVE_HOUR_WINDOW_HOURS, min_samples=5,
-)
+calib = app_cache.calibrate(df, calib_log_global)
+effective_5h_hours = calib.eff_hours
+n_observed_resets = calib.n_observed
 
 # Caps are calibrated against output tokens (Anthropic's actual metering signal).
 # Fallback uses a rough heuristic: Max 5x output cap ≈ 2.1M tokens/5h, weekly ≈ 100M.
 OUTPUT_CAP_5H_FALLBACK = 2_100_000.0
 OUTPUT_CAP_WEEKLY_FALLBACK = 100_000_000.0
-global_cap_5h, n_anchor_5h = caps_mod.global_cap_from_anchors(
-    calib_log_global, df, "5h", gap_hours=effective_5h_hours,
-)
-global_cap_week, n_anchor_week = caps_mod.global_cap_from_anchors(
-    calib_log_global, df, "weekly", gap_hours=24 * 7, min_util=0.10,
-)
+global_cap_5h = calib.cap_5h
+n_anchor_5h = calib.n_anchor_5h
+global_cap_week = calib.cap_weekly
+n_anchor_week = calib.n_anchor_weekly
 effective_cap_5h = global_cap_5h if global_cap_5h else OUTPUT_CAP_5H_FALLBACK
 effective_cap_week = global_cap_week if global_cap_week else OUTPUT_CAP_WEEKLY_FALLBACK
 
