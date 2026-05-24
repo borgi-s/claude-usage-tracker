@@ -436,26 +436,14 @@ def render_live_panel_from_cache(*, agent_seconds_old: float | None):
         st.caption("Calibrated · " + " · ".join(bits))
 
 
-def render_cost_vs_session_length(df: pl.DataFrame, log: pl.DataFrame) -> None:
-    """Binned mean+std of each session's attributed cap-% vs session size.
+@st.fragment
+def _cost_vs_session_length_interactive(sessions: pl.DataFrame, diag: dict) -> None:
+    """X-axis/bin controls + the two charts, isolated in a fragment.
 
-    df must be the derived cache (with `ts`); see the render-helper data-prep
-    convention. log is calibration_log.load_log().
+    Widget changes rerun only this block (cheap `bin_sessions` + redraw) instead of
+    the whole app — and never recompute the expensive, widget-independent attribution
+    upstream. `sessions`/`diag` come from the last full run via the captured args.
     """
-    st.subheader("Cost vs session length")
-    st.caption(
-        "Each session's measured share of the cap — attributed from real API % "
-        "deltas, split by output-token share — vs how big the session was. "
-        "An upward bend means longer sessions burn disproportionately more."
-    )
-    if df.is_empty():
-        st.info("No session data yet.")
-        return
-    sessions, diag = metrics.session_cost_attribution(df, log)
-    if sessions.is_empty():
-        st.info("Not enough calibration data to attribute cost yet.")
-        return
-
     x_label_to_col = {
         "Prompt tokens": "prompt_tokens",
         "Requests (turns)": "n_requests",
@@ -495,3 +483,29 @@ def render_cost_vs_session_length(df: pl.DataFrame, log: pl.DataFrame) -> None:
         f"5h {diag['unattributed_5h'] * 100:.1f}%, "
         f"weekly {diag['unattributed_7d'] * 100:.1f}% (cumulative across all windows)."
     )
+
+
+def render_cost_vs_session_length(df: pl.DataFrame, log: pl.DataFrame) -> None:
+    """Binned mean+std of each session's attributed cap-% vs session size.
+
+    df must be the derived cache (with `ts`); see the render-helper data-prep
+    convention. log is calibration_log.load_log().
+
+    Attribution (an expensive full-cache scan) is computed here, once per app run;
+    the interactive controls/charts live in a fragment so widget changes don't
+    trigger a full rerun or recompute attribution.
+    """
+    st.subheader("Cost vs session length")
+    st.caption(
+        "Each session's measured share of the cap — attributed from real API % "
+        "deltas, split by output-token share — vs how big the session was. "
+        "An upward bend means longer sessions burn disproportionately more."
+    )
+    if df.is_empty():
+        st.info("No session data yet.")
+        return
+    sessions, diag = metrics.session_cost_attribution(df, log)
+    if sessions.is_empty():
+        st.info("Not enough calibration data to attribute cost yet.")
+        return
+    _cost_vs_session_length_interactive(sessions, diag)
