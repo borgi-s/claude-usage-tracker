@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -427,9 +428,8 @@ def global_cap_from_anchors(
             .alias("week_start")
         ).sort("ts")
 
-        import warnings as _warnings
-        with _warnings.catch_warnings():
-            _warnings.simplefilter("ignore", UserWarning)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
             joined = anchors_with_ws.join_asof(
                 cache_with_ws.select(["ts", "week_start", "_cum_burn"]),
                 on="ts",
@@ -481,7 +481,7 @@ def global_cap_from_anchors(
 
         anchors_ts = anchors.select(
             [pl.col("sampled_at").alias("ts"), pl.col(util_col)]
-        )
+        ).sort("ts")
 
         joined = anchors_ts.join_asof(
             cache_with_wid.select(["ts", "_cum_burn"]),

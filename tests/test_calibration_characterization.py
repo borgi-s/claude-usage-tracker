@@ -279,6 +279,82 @@ class TestGlobalCapFromAnchors:
             _LOG_5H, cache_no_col, kind="5h", gap_hours=5.0, value_col="output_tokens"
         ) == (None, 0)
 
+    def test_5h_out_of_order_anchors_do_not_raise_and_match_sorted(self):
+        """5h join_asof requires the left (anchors) frame sorted by ts.
+
+        Build a log whose anchor rows are intentionally reversed (later timestamp
+        first) and assert that the call neither raises nor changes the result
+        compared to a pre-sorted copy of the same log.
+        """
+        # Two anchors: cluster B row before cluster A row (reverse chronological).
+        log_reversed = pl.DataFrame(
+            {
+                "sampled_at": [
+                    _BASE_5H + timedelta(hours=6, minutes=5),  # cluster B — first
+                    _BASE_5H + timedelta(minutes=5),           # cluster A — second
+                ],
+                "util_5h": [0.98, 0.97],
+                "util_7d":  [0.3,  0.3],
+                "resets_5h_iso": [None, None],
+            },
+            schema={
+                "sampled_at": pl.Datetime("ms", "UTC"),
+                "util_5h": pl.Float64,
+                "util_7d": pl.Float64,
+                "resets_5h_iso": pl.Utf8,
+            },
+        )
+        # Golden: same anchors in sorted (chronological) order.
+        log_sorted = log_reversed.sort("sampled_at")
+
+        golden_cap, golden_n = caps.global_cap_from_anchors(
+            log_sorted, _CACHE_5H, kind="5h", gap_hours=5.0, min_util=0.95
+        )
+        result_cap, result_n = caps.global_cap_from_anchors(
+            log_reversed, _CACHE_5H, kind="5h", gap_hours=5.0, min_util=0.95
+        )
+
+        assert result_n == golden_n
+        assert result_cap == pytest.approx(golden_cap, rel=1e-9)
+
+    def test_weekly_out_of_order_anchors_do_not_raise_and_match_sorted(self):
+        """Weekly join_asof requires the left (anchors) frame sorted by ts.
+
+        Build a log whose anchor rows are intentionally reversed (later timestamp
+        first) and assert that the call neither raises nor changes the result
+        compared to a pre-sorted copy of the same log.
+        """
+        # Two anchors: week B row before week A row (reverse chronological).
+        log_reversed = pl.DataFrame(
+            {
+                "sampled_at": [
+                    _WEEK_RESET_UTC + timedelta(days=2),   # Tue (week B) — first
+                    _WEEK_RESET_UTC - timedelta(days=1),   # Sat (week A) — second
+                ],
+                "util_5h": [0.3, 0.3],
+                "util_7d":  [0.30, 0.30],
+                "resets_5h_iso": [None, None],
+            },
+            schema={
+                "sampled_at": pl.Datetime("ms", "UTC"),
+                "util_5h": pl.Float64,
+                "util_7d": pl.Float64,
+                "resets_5h_iso": pl.Utf8,
+            },
+        )
+        # Golden: same anchors in sorted (chronological) order.
+        log_sorted = log_reversed.sort("sampled_at")
+
+        golden_cap, golden_n = caps.global_cap_from_anchors(
+            log_sorted, _CACHE_WEEKLY, kind="weekly", gap_hours=5.0, min_util=0.10
+        )
+        result_cap, result_n = caps.global_cap_from_anchors(
+            log_reversed, _CACHE_WEEKLY, kind="weekly", gap_hours=5.0, min_util=0.10
+        )
+
+        assert result_n == golden_n
+        assert result_cap == pytest.approx(golden_cap, rel=1e-9)
+
 
 # ===========================================================================
 # Tests — metrics.observed_window_lengths
