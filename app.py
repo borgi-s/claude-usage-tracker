@@ -325,37 +325,27 @@ df_with_caps = df_with_mask.with_columns(
 # ---------- KPIs ----------
 # Lifetime KPIs (over full df, not project-filtered — represents true cap usage)
 total_cw = float(df["cost_weighted_tokens"].sum())
-sessions = metrics.session_summaries(fdf)
-five_h = metrics.five_hour_burn_since_reset(
-    df_with_caps, gap_hours=effective_5h_hours,
-    value_col="share_5h", selected_mask_col="is_selected",
+
+fc = app_cache.filtered_compute(
+    df_with_caps, fdf, selected_projects, selected_models,
+    effective_5h_hours, effective_cap_5h, effective_cap_week,
 )
-weekly = metrics.weekly_burn_since_reset(
-    df_with_caps, value_col="share_week", selected_mask_col="is_selected",
-)
+sessions = fc.sessions
+five_h = fc.five_h
+weekly = fc.weekly
+five_h_window_shares = fc.five_h_window_shares
+per_week_shares = fc.per_week_shares
+daily = fc.daily
+
 peak_5h_share = float(five_h["cumulative_total"].max() or 0)
 peak_weekly_share = float(weekly["cumulative_total"].max() or 0)
 
 span_days = max((df["ts"].max() - df["ts"].min()).total_seconds() / 86400.0, 1.0)
 daily_avg = total_cw / span_days
 
-# Per-window totals across the full df (not project-filtered) for lifetime KPI honesty
-five_h_window_shares = metrics.five_hour_window_totals(
-    df_with_caps, gap_hours=effective_5h_hours, value_col="share_5h",
-)
 windows_over_pro_5h = sum(1 for s in five_h_window_shares if s > 0.20)
 windows_total_5h = len(five_h_window_shares)
 
-per_week_shares = (
-    df_with_caps.with_columns(
-        pl.col("ts")
-        .map_elements(metrics.week_start_for, return_dtype=pl.Datetime("us", "UTC"))
-        .cast(pl.Datetime("ms", "UTC"))
-        .alias("week_start")
-    )
-    .group_by("week_start")
-    .agg(pl.col("share_week").sum().alias("week_share"))
-)
 weeks_over_pro = per_week_shares.filter(pl.col("week_share") > 0.20).height
 weeks_total = per_week_shares.height
 
@@ -378,7 +368,6 @@ render.render_weekly_chart(
 )
 
 # ---------- Chart 3: Daily stacked ----------
-daily = metrics.daily_stacked(fdf)
 render.render_daily_bar(daily)
 
 
