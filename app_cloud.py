@@ -26,10 +26,24 @@ import supabase_sync
 st.set_page_config(page_title="Claude usage tracker — cloud", layout="wide")
 
 DATA_DIR = Path(os.environ.get("CLOUD_DATA_DIR", "/tmp/usage-tracker"))
-FILE_NAMES = ["cache.parquet", "caps.json", "calibration_log.parquet"]
-# Per-user folder in the bucket (the Rust agent's SUPABASE_USER_PREFIX). Empty =
-# read from bucket root, matching the legacy Python agent's upload location.
-USER_PREFIX = os.environ.get("CLOUD_USER_PREFIX", "").strip("/")
+# Account-wide files (caps + calibration) come from ONE canonical prefix — the
+# always-on poller. The merged cache.parquet is built from all machine prefixes.
+CAPS_FILE_NAMES = ["caps.json", "calibration_log.parquet"]
+
+
+def _prefixes() -> list[str]:
+    """Machine prefixes to merge. CLOUD_USER_PREFIXES (comma-separated) wins;
+    falls back to the legacy single CLOUD_USER_PREFIX ('' = bucket root)."""
+    multi = os.environ.get("CLOUD_USER_PREFIXES", "").strip()
+    if multi:
+        return [p.strip().strip("/") for p in multi.split(",") if p.strip()]
+    return [os.environ.get("CLOUD_USER_PREFIX", "").strip("/")]
+
+
+PREFIXES = _prefixes()
+# Caps/calibration are account-wide (same on every machine), so read them from one
+# prefix — the always-on poller. Defaults to the first prefix if unset.
+CAPS_PREFIX = os.environ.get("CLOUD_CAPS_PREFIX", PREFIXES[0]).strip("/")
 
 
 @st.cache_resource
@@ -56,18 +70,39 @@ _redirect_paths_to_data_dir()
 def refresh_data_panel():
     client, bucket = _client()
     try:
-        mtime = supabase_sync.last_modified_at(client, bucket, "cache.parquet", prefix=USER_PREFIX)
-        mtime_key = mtime.isoformat() if mtime else None
-        # Only re-download (and invalidate the chart cache) when the agent has
-        # actually written new data. Skipping the download on no-op polls keeps
-        # the fragment's stale-fade brief.
+        # Freshness across ALL machines: re-download only when any prefix's
+        # cache.parquet changed. Compute each prefix's mtime once; reuse for both
+        # the change-key and the "newest activity" age shown in the live panel.
+        mtimes = {
+            p: supabase_sync.last_modified_at(client, bucket, "cache.parquet", prefix=p)
+            for p in PREFIXES
+        }
+        mtime_key = "|".join(
+            f"{p}:{mt.isoformat() if mt else 'none'}" for p, mt in mtimes.items()
+        )
         if mtime_key != st.session_state.get("last_cache_mtime"):
-            supabase_sync.download_files(client, bucket, FILE_NAMES, target_dir=DATA_DIR, prefix=USER_PREFIX)
+            # 1. Download each machine's cache.parquet to a distinct local file and
+            #    merge into config.CACHE_PATH (with a `machine` column per row).
+            prefix_paths = supabase_sync.download_cache_per_prefix(
+                client, bucket, PREFIXES, target_dir=DATA_DIR
+            )
+            cache.merge_cache_parquets(prefix_paths, config.CACHE_PATH)
+            # 2. caps.json + calibration_log are account-wide — take them from the
+            #    canonical (poller) prefix only. Best-effort: a missing caps file
+            #    must not block the merged cache view (the viewer has fallback caps).
+            try:
+                supabase_sync.download_files(
+                    client, bucket, CAPS_FILE_NAMES, target_dir=DATA_DIR, prefix=CAPS_PREFIX
+                )
+            except Exception as caps_err:
+                st.warning(f"Caps/calibration unavailable from '{CAPS_PREFIX}': {caps_err}")
             st.session_state["last_cache_mtime"] = mtime_key
             load_data.clear()
-        seconds_old = None
-        if mtime is not None:
-            seconds_old = (datetime.now(tz=timezone.utc) - mtime).total_seconds()
+        # Live-panel age = newest activity across all machines.
+        newest = max((mt for mt in mtimes.values() if mt is not None), default=None)
+        seconds_old = (
+            (datetime.now(tz=timezone.utc) - newest).total_seconds() if newest else None
+        )
         render.render_live_panel_from_cache(agent_seconds_old=seconds_old)
     except Exception as e:
         st.error(f"Could not fetch latest from Supabase: {e}")
@@ -80,7 +115,7 @@ def load_data():
 
 
 st.title("Claude usage tracker")
-st.caption("Read-only cloud view · refreshes every 5 min · data flows from your Windows agent → Supabase → here.")
+st.caption("Read-only cloud view · refreshes every 5 min · data flows from your machines → Supabase → here.")
 
 refresh_data_panel()
 
