@@ -42,11 +42,22 @@ copy .env.example .env
 2. share.streamlit.io → New app → point at `app_cloud.py`.
 3. Settings → Secrets:
    ```
+   # Top-level keys are also exposed as environment variables.
+   CLOUD_USER_PREFIXES = "borgi,borgi-linux"
+   CLOUD_CAPS_PREFIX   = "borgi-linux"
+
    [supabase]
    url = "https://YOUR_PROJECT_REF.supabase.co"
    anon_key = "eyJ..."
    bucket = "usage-tracker"
    ```
+   - `CLOUD_USER_PREFIXES` — comma-separated machine prefixes to merge into one view
+     (each machine's agent uploads under its own prefix). The merged cache gets a
+     `machine` column per row. The legacy single `CLOUD_USER_PREFIX` still works as a
+     fallback when this is unset (it just shows one machine).
+   - `CLOUD_CAPS_PREFIX` — which prefix supplies the account-wide caps/calibration
+     (set it to the always-on poller, e.g. `borgi-linux`). Defaults to the first entry
+     of `CLOUD_USER_PREFIXES` if unset.
 4. Save. Bookmark the `*.streamlit.app` URL.
 
 ## Module map
