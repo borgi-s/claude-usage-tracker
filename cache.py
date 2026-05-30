@@ -96,6 +96,28 @@ def load_cache() -> pl.DataFrame:
     return pl.read_parquet(config.CACHE_PATH)
 
 
+def merge_cache_parquets(prefix_paths: dict[str, Path], out_path: Path) -> int:
+    """Merge per-machine cache.parquet files into one frame at out_path.
+
+    For each (prefix, path) in prefix_paths, read the parquet and add a `machine`
+    column equal to the prefix, then diagonal-concat all of them (diagonal so two
+    machines on different agent versions can't break the concat). Writes the merged
+    frame to out_path and returns its row count. With no inputs, writes a
+    schema-only (empty) cache carrying the `machine` column so load_cache() and the
+    downstream pipeline still work.
+    """
+    frames = []
+    for prefix, path in prefix_paths.items():
+        df = pl.read_parquet(path).with_columns(pl.lit(prefix).alias("machine"))
+        frames.append(df)
+    if frames:
+        merged = pl.concat(frames, how="diagonal")
+    else:
+        merged = pl.DataFrame(schema={**ROW_SCHEMA, "machine": pl.Utf8})
+    merged.write_parquet(out_path)
+    return merged.height
+
+
 if __name__ == "__main__":
     _, stats = refresh_cache()
     print(stats)
