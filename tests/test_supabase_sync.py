@@ -43,3 +43,34 @@ def test_last_modified_at_returns_parsed_datetime(fake_client):
     ts = supabase_sync.last_modified_at(fake_client, "usage-tracker", "cache.parquet")
     assert ts is not None
     assert ts.year == 2026 and ts.month == 5 and ts.day == 21
+
+
+def test_download_cache_per_prefix_writes_distinct_local_files(tmp_path, fake_client):
+    result = supabase_sync.download_cache_per_prefix(
+        fake_client, "usage-tracker", ["borgi", "borgi-linux"], target_dir=tmp_path
+    )
+    assert set(result.keys()) == {"borgi", "borgi-linux"}
+    # distinct local filenames per prefix (no collision)
+    assert result["borgi"] != result["borgi-linux"]
+    for p in result.values():
+        assert p.exists()
+        assert p.read_bytes() == b"binary content"
+    # downloaded cache.parquet under each prefix
+    downloaded = [c.args[0] for c in fake_client.storage.download.call_args_list]
+    assert "borgi/cache.parquet" in downloaded
+    assert "borgi-linux/cache.parquet" in downloaded
+
+
+def test_download_cache_per_prefix_skips_missing_object(tmp_path, fake_client):
+    # First prefix downloads fine; second raises (no object yet) and is skipped.
+    def _dl(remote):
+        if remote.startswith("borgi-linux/"):
+            raise Exception("Object not found")
+        return b"binary content"
+    fake_client.storage.download = MagicMock(side_effect=_dl)
+
+    result = supabase_sync.download_cache_per_prefix(
+        fake_client, "usage-tracker", ["borgi", "borgi-linux"], target_dir=tmp_path
+    )
+    assert set(result.keys()) == {"borgi"}
+    assert result["borgi"].exists()

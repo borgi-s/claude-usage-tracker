@@ -34,6 +34,30 @@ def download_files(
         (target_dir / name).write_bytes(data)
 
 
+def download_cache_per_prefix(
+    client, bucket: str, prefixes: Iterable[str], target_dir: Path
+) -> dict[str, Path]:
+    """Download each prefix's `cache.parquet` to a DISTINCT local file so per-machine
+    caches don't overwrite each other locally. Returns {prefix: local_path} for the
+    prefixes whose object downloaded successfully; a prefix with no object yet (e.g. a
+    machine that hasn't uploaded) is skipped silently. The local name encodes the
+    prefix; an empty-string prefix (bucket root) maps to 'root'."""
+    target_dir = Path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    out: dict[str, Path] = {}
+    for prefix in prefixes:
+        remote = f"{prefix}/cache.parquet" if prefix else "cache.parquet"
+        try:
+            data = client.storage.from_(bucket).download(remote)
+        except Exception:
+            # Machine hasn't uploaded a cache.parquet yet — skip it.
+            continue
+        local = target_dir / f"cache__{prefix or 'root'}.parquet"
+        local.write_bytes(data)
+        out[prefix] = local
+    return out
+
+
 def last_modified_at(client, bucket: str, name: str, prefix: str = "") -> datetime | None:
     items = client.storage.from_(bucket).list(path=prefix)
     for it in items:
