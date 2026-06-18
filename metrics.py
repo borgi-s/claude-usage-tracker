@@ -308,30 +308,39 @@ def rolling_burn(df: pl.DataFrame, window: str, by_subagent: bool = True) -> pl.
     ).select(["ts", "rolling_total"])
 
 
-def daily_stacked(df: pl.DataFrame) -> pl.DataFrame:
+def daily_stacked(df: pl.DataFrame, by: str = "is_subagent",
+                  value_col: str = "dollar_cost") -> pl.DataFrame:
+    """Sum value_col per (UTC) day, pivoted by `by`.
+
+    by="is_subagent" -> columns date, main, subagent.
+    by="machine"     -> columns date, <machine values...>; a single 'local' column
+                        when df has no 'machine' column (local single-machine cache).
+    """
     if df.is_empty():
-        return pl.DataFrame(schema={"date": pl.Date, "main": pl.Float64, "subagent": pl.Float64})
+        return pl.DataFrame(schema={"date": pl.Date})
+    work = df.with_columns(pl.col("ts").dt.date().alias("date"))
+    dim = by
+    if by == "machine" and "machine" not in work.columns:
+        work = work.with_columns(pl.lit("local").alias("machine"))
     pivoted = (
-        df.with_columns(pl.col("ts").dt.date().alias("date"))
-        .group_by(["date", "is_subagent"])
-        .agg(pl.col("cost_weighted_tokens").sum().alias("total"))
-        .pivot(values="total", index="date", on="is_subagent")
+        work.group_by(["date", dim])
+        .agg(pl.col(value_col).sum().alias("v"))
+        .pivot(values="v", index="date", on=dim)
         .sort("date")
+        .fill_null(0.0)
     )
-    rename_map = {}
-    for c in pivoted.columns:
-        if c in ("true", "True"):
-            rename_map[c] = "subagent"
-        elif c in ("false", "False"):
-            rename_map[c] = "main"
-    pivoted = pivoted.rename(rename_map)
-    for needed in ("main", "subagent"):
-        if needed not in pivoted.columns:
-            pivoted = pivoted.with_columns(pl.lit(0.0).alias(needed))
-    return pivoted.with_columns(
-        pl.col("main").fill_null(0.0),
-        pl.col("subagent").fill_null(0.0),
-    )
+    if by == "is_subagent":
+        rename_map = {}
+        for c in pivoted.columns:
+            if c in ("true", "True"):
+                rename_map[c] = "subagent"
+            elif c in ("false", "False"):
+                rename_map[c] = "main"
+        pivoted = pivoted.rename(rename_map)
+        for needed in ("main", "subagent"):
+            if needed not in pivoted.columns:
+                pivoted = pivoted.with_columns(pl.lit(0.0).alias(needed))
+    return pivoted
 
 
 def fraction_time_over_cap(rolling_df: pl.DataFrame, cap: float, col: str = "rolling_total") -> float:
