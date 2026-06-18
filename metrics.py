@@ -1,6 +1,7 @@
 """Pure computation: cost weighting, rolling windows, per-session context curves."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from statistics import median
 from zoneinfo import ZoneInfo
@@ -148,6 +149,52 @@ def _max5x(log: pl.DataFrame) -> pl.DataFrame:
     if log.is_empty() or "rate_limit_tier" not in log.columns:
         return log.head(0)
     return log.filter(pl.col("rate_limit_tier") == MAX5X_TIER)
+
+
+@dataclass
+class CapProjection:
+    eta: timedelta | None       # time from `now` until util reaches 1.0
+    before_reset: bool          # whether 100% arrives before the window resets
+
+
+def project_time_to_cap(log: pl.DataFrame, now: datetime, kind: str = "5h") -> CapProjection:
+    """Project time until utilization reaches 100% based on burn-rate slope.
+
+    Computes the slope of utilization change over the current (jitter-tolerant) window,
+    extrapolates to util=1.0, and returns the ETA. If the projected 100% time is past
+    the parsed window reset, before_reset is False.
+
+    Returns CapProjection(eta=None, before_reset=True) when:
+    - <2 in-window samples, OR
+    - flat or declining utilization (slope <= 0)
+    """
+    util_col = "util_5h" if kind == "5h" else "util_7d"
+    reset_col = "resets_5h_iso" if kind == "5h" else "resets_7d_iso"
+    mx = _max5x(log).drop_nulls(["sampled_at", util_col]).sort("sampled_at")
+    if mx.height < 2:
+        return CapProjection(None, True)
+    reset_list = mx[reset_col].to_list() if reset_col in mx.columns else [None] * mx.height
+    wids = _window_ids(mx["sampled_at"].to_list(), reset_list, kind)
+    last_wid = wids[-1]
+    cur = [(t, u, r) for t, u, r, w in
+           zip(mx["sampled_at"].to_list(), mx[util_col].to_list(), reset_list, wids)
+           if w == last_wid]
+    if len(cur) < 2:
+        return CapProjection(None, True)
+    t0, u0, _ = cur[0]
+    t1, u1, r1 = cur[-1]
+    dt_s = (t1 - t0).total_seconds()
+    if dt_s <= 0 or (u1 - u0) <= 0:
+        return CapProjection(None, True)
+    slope = (u1 - u0) / dt_s              # util per second, > 0
+    secs_to_full = (1.0 - u1) / slope
+    full_ts = t1 + timedelta(seconds=secs_to_full)
+    eta = full_ts - now
+    if eta.total_seconds() < 0:
+        eta = timedelta(0)
+    reset_dt = _parse_reset(r1)
+    before_reset = reset_dt is None or full_ts <= reset_dt
+    return CapProjection(eta, before_reset)
 
 
 def reported_util_series(log: pl.DataFrame, kind: str, gap_break_minutes: int | None = None):
