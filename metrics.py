@@ -107,6 +107,128 @@ def add_derived(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+MAX5X_TIER = "default_claude_max_5x"
+_RESET_JUMP = {"5h": timedelta(minutes=30), "weekly": timedelta(days=1)}
+_DEFAULT_GAP_MIN = {"5h": 15, "weekly": 60}
+
+
+def _parse_reset(s):
+    """Parse an ISO reset string to tz-aware UTC datetime."""
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _window_ids(ts_list, reset_list, kind: str) -> list[int]:
+    """Jitter-tolerant integer window id per sample. New id when the parsed reset
+    time jumps forward by more than the kind's tolerance (resets jitter by seconds;
+    a real reset jumps ~5h / ~7d)."""
+    jump = _RESET_JUMP[kind]
+    ids: list[int] = []
+    wid = -1
+    prev_reset = None
+    for r in reset_list:
+        rdt = _parse_reset(r)
+        if wid < 0:
+            wid = 0
+        elif rdt is not None and prev_reset is not None and (rdt - prev_reset) > jump:
+            wid += 1
+        ids.append(wid)
+        if rdt is not None:
+            prev_reset = rdt
+    return ids
+
+
+def _max5x(log: pl.DataFrame) -> pl.DataFrame:
+    """Filter log to Max-5x tier rows only."""
+    if log.is_empty() or "rate_limit_tier" not in log.columns:
+        return log.head(0)
+    return log.filter(pl.col("rate_limit_tier") == MAX5X_TIER)
+
+
+def reported_util_series(log: pl.DataFrame, kind: str, gap_break_minutes: int | None = None):
+    """Return (series, cap_hits) from calibration log.
+
+    series: DataFrame with ts (Datetime) + util_pct (Float64, None at break boundaries)
+    cap_hits: DataFrame with ts + util_pct for samples with util >= 0.99
+
+    Max-5x only; breaks at real resets (parsed-time jump) and sampling gaps.
+    """
+    util_col = "util_5h" if kind == "5h" else "util_7d"
+    reset_col = "resets_5h_iso" if kind == "5h" else "resets_7d_iso"
+    out_schema = {"ts": pl.Datetime("ms", "UTC"), "util_pct": pl.Float64}
+    empty = pl.DataFrame(schema=out_schema)
+    if log.is_empty() or util_col not in log.columns:
+        return empty, empty
+    mx = _max5x(log).drop_nulls(["sampled_at", util_col]).sort("sampled_at")
+    if mx.is_empty():
+        return empty, empty
+    gap = timedelta(minutes=gap_break_minutes if gap_break_minutes is not None
+                    else _DEFAULT_GAP_MIN[kind])
+    jump = _RESET_JUMP[kind]
+    ts_list = mx["sampled_at"].to_list()
+    util_list = mx[util_col].to_list()
+    reset_list = mx[reset_col].to_list() if reset_col in mx.columns else [None] * len(ts_list)
+
+    xs: list = []
+    ys: list = []
+    prev_ts = None
+    prev_reset = None
+    for ts, u, r in zip(ts_list, util_list, reset_list):
+        rdt = _parse_reset(r)
+        if prev_ts is not None:
+            gap_hit = (ts - prev_ts) > gap
+            reset_hit = (rdt is not None and prev_reset is not None and (rdt - prev_reset) > jump)
+            if gap_hit or reset_hit:
+                xs.append(ts)
+                ys.append(None)
+        xs.append(ts)
+        ys.append(float(u) * 100.0)
+        prev_ts = ts
+        if rdt is not None:
+            prev_reset = rdt
+
+    series = pl.DataFrame({"ts": xs, "util_pct": ys}, schema=out_schema)
+    cap_hits = mx.filter(pl.col(util_col) >= 0.99).select(
+        pl.col("sampled_at").alias("ts"),
+        (pl.col(util_col) * 100.0).alias("util_pct"),
+    )
+    return series, cap_hits
+
+
+def peak_reported(log: pl.DataFrame, kind: str):
+    """Return max util over Max-5x samples."""
+    util_col = "util_5h" if kind == "5h" else "util_7d"
+    mx = _max5x(log)
+    if mx.is_empty() or util_col not in mx.columns:
+        return None
+    vals = mx.drop_nulls(util_col)
+    return float(vals[util_col].max()) if not vals.is_empty() else None
+
+
+def windows_over_threshold(log: pl.DataFrame, kind: str, threshold: float) -> tuple[int, int]:
+    """Return (n_windows_over, n_windows_total) by jitter-tolerant window id."""
+    util_col = "util_5h" if kind == "5h" else "util_7d"
+    reset_col = "resets_5h_iso" if kind == "5h" else "resets_7d_iso"
+    mx = _max5x(log).drop_nulls(["sampled_at", util_col]).sort("sampled_at")
+    if mx.is_empty():
+        return 0, 0
+    reset_list = mx[reset_col].to_list() if reset_col in mx.columns else [None] * mx.height
+    wids = _window_ids(mx["sampled_at"].to_list(), reset_list, kind)
+    grouped = (
+        mx.with_columns(pl.Series("_wid", wids))
+        .group_by("_wid")
+        .agg(pl.col(util_col).max().alias("peak"))
+    )
+    n_total = grouped.height
+    n_over = grouped.filter(pl.col("peak") > threshold).height
+    return n_over, n_total
+
+
 def rolling_burn(df: pl.DataFrame, window: str, by_subagent: bool = True) -> pl.DataFrame:
     """Rolling sum of cost_weighted_tokens over `window` (e.g., '5h', '7d').
 
