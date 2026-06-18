@@ -103,7 +103,8 @@ def refresh_data_panel():
         seconds_old = (
             (datetime.now(tz=timezone.utc) - newest).total_seconds() if newest else None
         )
-        render.render_live_panel_from_cache(agent_seconds_old=seconds_old)
+        render.render_live_panel_from_cache(
+            agent_seconds_old=seconds_old, log=calibration_log.load_log())
     except Exception as e:
         st.error(f"Could not fetch latest from Supabase: {e}")
 
@@ -144,11 +145,6 @@ with st.sidebar:
                                index=2)
 
     st.divider()
-    st.subheader("Plan caps (read-only)")
-    st.caption("Calibrated against output tokens — Anthropic's actual rate-limit signal.")
-    show_max5x = st.checkbox("Show Max 5x line too", value=True)
-
-    st.divider()
     st.subheader("Session table filter")
     min_turns = st.number_input("Min main turns", min_value=1, max_value=100, value=5, step=1)
     min_duration_s = st.number_input("Min duration (seconds)", min_value=0, max_value=3600, value=60, step=10)
@@ -172,65 +168,24 @@ data_start_ts = df["ts"].min()
 data_end_ts = df["ts"].max()
 
 
-calib_log_global = calibration_log.load_log()
-calib = app_cache.calibrate(df, calib_log_global)
-effective_5h_hours = calib.eff_hours
-n_observed_resets = calib.n_observed
+log = calibration_log.load_log()
 
-OUTPUT_CAP_5H_FALLBACK = 2_100_000.0
-OUTPUT_CAP_WEEKLY_FALLBACK = 100_000_000.0
-global_cap_5h = calib.cap_5h
-n_anchor_5h = calib.n_anchor_5h
-global_cap_week = calib.cap_weekly
-n_anchor_week = calib.n_anchor_weekly
-effective_cap_5h = global_cap_5h if global_cap_5h else OUTPUT_CAP_5H_FALLBACK
-effective_cap_week = global_cap_week if global_cap_week else OUTPUT_CAP_WEEKLY_FALLBACK
-
-df_with_caps = df_with_mask.with_columns(
-    (pl.col("output_tokens") / effective_cap_5h).alias("share_5h"),
-    (pl.col("output_tokens") / effective_cap_week).alias("share_week"),
-)
-
-total_cw = float(df["cost_weighted_tokens"].sum())
-
-fc = app_cache.filtered_compute(
-    df_with_caps, fdf, selected_projects, selected_models,
-    effective_5h_hours, effective_cap_5h, effective_cap_week,
-)
-sessions = fc.sessions
-five_h = fc.five_h
-weekly = fc.weekly
-five_h_window_shares = fc.five_h_window_shares
-per_week_shares = fc.per_week_shares
-daily = fc.daily
-
-peak_5h_share = float(five_h["cumulative_total"].max() or 0)
-peak_weekly_share = float(weekly["cumulative_total"].max() or 0)
-
+total_usd = float(df["dollar_cost"].sum())
 span_days = max((df["ts"].max() - df["ts"].min()).total_seconds() / 86400.0, 1.0)
-daily_avg = total_cw / span_days
+daily_avg_usd = total_usd / span_days
+peak_5h = metrics.peak_reported(log, "5h")
+peak_weekly = metrics.peak_reported(log, "weekly")
+w5_over, w5_total = metrics.windows_over_threshold(log, "5h", 0.20)
+wk_over, wk_total = metrics.windows_over_threshold(log, "weekly", 0.20)
 
-windows_over_pro_5h = sum(1 for s in five_h_window_shares if s > 0.20)
-windows_total_5h = len(five_h_window_shares)
+render.render_kpis(total_usd, daily_avg_usd, peak_5h, peak_weekly,
+                   w5_over, w5_total, wk_over, wk_total)
+render.render_reported_usage_chart(log, "5h", data_start_ts, data_end_ts)
+render.render_reported_usage_chart(log, "weekly", data_start_ts, data_end_ts)
+render.render_daily_bar(fdf, decomposition_key="cloud")
 
-weeks_over_pro = per_week_shares.filter(pl.col("week_share") > 0.20).height
-weeks_total = per_week_shares.height
-
-
-render.render_kpis(total_cw, daily_avg, peak_5h_share, peak_weekly_share,
-                   windows_over_pro_5h, windows_total_5h, weeks_over_pro, weeks_total)
-render.render_5h_chart(
-    five_h, effective_5h_hours, n_observed_resets, n_anchor_5h,
-    effective_cap_5h, show_max5x, data_start_ts, data_end_ts,
-    decomposition_key="cloud",
-)
-render.render_weekly_chart(
-    weekly, n_anchor_week, effective_cap_week,
-    show_max5x, data_start_ts, data_end_ts,
-    decomposition_key="cloud",
-)
-render.render_daily_bar(daily)
-render.render_cost_vs_session_length(df, calib_log_global)
+fc = app_cache.filtered_compute(fdf)
+sessions = fc.sessions
 
 sessions_with_dur = sessions.with_columns(
     ((pl.col("end") - pl.col("start")).dt.total_milliseconds() / 1000.0).alias("duration_s")
@@ -247,5 +202,3 @@ elif sort_choice == "total cost-weighted":
 else:
     sessions_sorted = sessions_filtered.sort("start")
 render.render_sessions_table(sessions_sorted, hidden, min_turns, min_duration_s)
-
-render.render_calibration_history(df)
