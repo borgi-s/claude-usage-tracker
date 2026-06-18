@@ -118,38 +118,51 @@ def add_calendar_bands(fig, start_utc: datetime, end_utc: datetime) -> None:
         cur += timedelta(days=1)
 
 
-def render_kpis(
-    total_cw: float, daily_avg: float,
-    peak_5h_share: float, peak_weekly_share: float,
-    windows_over_pro_5h: int, windows_total_5h: int,
-    weeks_over_pro: int, weeks_total: int,
-):
+def render_kpis(total_usd: float, daily_avg_usd: float,
+                peak_5h: float | None, peak_weekly: float | None,
+                windows_over_pro_5h: int, windows_total_5h: int,
+                weeks_over_pro: int, weeks_total: int):
+    def pct(v):
+        return f"{v*100:.0f}%" if v is not None else "—"
     k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("Cost-weighted", f"{total_cw/1e6:.1f}M")
-    k2.metric("Daily avg", f"{daily_avg/1e6:.1f}M/d")
-    k3.metric("Peak 5h", f"{peak_5h_share*100:.0f}%",
-              help="% of Max 5x 5h cap (peak across all windows)")
+    k1.metric("Total $", f"${total_usd:,.0f}")
+    k2.metric("Daily avg", f"${daily_avg_usd:,.1f}/d")
+    k3.metric("Peak 5h", pct(peak_5h), help="Max reported 5h utilization (Max 5x)")
     k4.metric("5h-windows over Pro", f"{windows_over_pro_5h} / {windows_total_5h}")
-    k5.metric("Peak weekly", f"{peak_weekly_share*100:.0f}%",
-              help="% of Max 5x weekly cap (peak across all weeks)")
+    k5.metric("Peak weekly", pct(peak_weekly), help="Max reported weekly utilization (Max 5x)")
     k6.metric("Weeks over Pro", f"{weeks_over_pro} / {weeks_total}")
 
 
-def render_daily_bar(daily: pl.DataFrame):
-    st.subheader("Daily burn — main vs subagents")
+_DAILY_PALETTE = ["#4f8cff", "#ff8a4f", "#46b46e", "#b46edc", "#dcb446", "#46b4b4"]
+
+
+def build_daily_figure(daily: pl.DataFrame) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=daily["date"].to_list(), y=daily["main"].to_list(),
-                         name="main thread", marker_color="#4f8cff"))
-    fig.add_trace(go.Bar(x=daily["date"].to_list(), y=daily["subagent"].to_list(),
-                         name="subagents", marker_color="#ff8a4f"))
+    series_cols = [c for c in daily.columns if c != "date"]
+    x = daily["date"].to_list()
+    for i, col in enumerate(series_cols):
+        fig.add_trace(go.Bar(x=x, y=daily[col].to_list(), name=col,
+                             marker_color=_DAILY_PALETTE[i % len(_DAILY_PALETTE)]))
     fig.update_layout(
         barmode="stack", height=300, margin=dict(t=60, b=20, l=10, r=10),
-        yaxis_title="cost-weighted tokens",
-        yaxis=dict(autorange=True),
-        xaxis=_rangeselector_xaxis(),
-        legend=dict(orientation="h"),
+        yaxis_title="USD", yaxis=dict(autorange=True),
+        xaxis=_rangeselector_xaxis(), legend=dict(orientation="h"),
     )
-    st.plotly_chart(fig, width="stretch")
+    return fig
+
+
+def render_daily_bar(fdf: pl.DataFrame, decomposition_key: str) -> None:
+    st.subheader("Daily burn (USD)")
+    st.caption("Estimated API-equivalent cost (what this usage would cost at pay-as-you-go "
+               "API rates — comparable to ccusage). Cache writes priced at 1.25× input (5m).")
+    mode = st.radio("Decomposition", ["by machine", "main vs sub"],
+                    index=0, horizontal=True, key=f"daily_decomp_{decomposition_key}")
+    by = "machine" if mode == "by machine" else "is_subagent"
+    daily = metrics.daily_stacked(fdf, by=by)
+    if daily.is_empty():
+        st.info("No data for the daily chart.")
+        return
+    st.plotly_chart(build_daily_figure(daily), width="stretch")
 
 
 def render_sessions_table(sessions_sorted: pl.DataFrame, hidden: int,
