@@ -34,47 +34,52 @@ def _rangeselector_xaxis() -> dict:
     )
 
 
-def _add_cumulative_traces(fig: go.Figure, df: pl.DataFrame, decomposition: str) -> None:
-    """Two render modes for the cumulative chart:
-       - 'project share': total grey line + selected filled area
-       - 'main vs sub':   stacked main + sub area (matches legacy behavior)
-    """
-    ts = df["ts"].to_list()
-    if decomposition == "main vs sub":
-        y_main = (df["cumulative_main"] * 100).to_list()
-        y_sub = (df["cumulative_sub"] * 100).to_list()
+def build_reported_figure(series: pl.DataFrame, cap_hits: pl.DataFrame, kind: str,
+                          data_start_ts, data_end_ts) -> go.Figure:
+    label = "5h" if kind == "5h" else "weekly"
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=series["ts"].to_list(), y=series["util_pct"].to_list(),
+        mode="lines", name=f"reported {label} util",
+        line=dict(width=1.6, color="#4f8cff"), connectgaps=False,
+    ))
+    if not cap_hits.is_empty():
         fig.add_trace(go.Scatter(
-            x=ts, y=y_main, mode="lines", name="main thread",
-            stackgroup="one", line=dict(width=0.5, color="#4f8cff", shape="hv"),
+            x=cap_hits["ts"].to_list(), y=cap_hits["util_pct"].to_list(),
+            mode="markers", name="cap hit (≥99%)",
+            marker=dict(size=8, color="red", symbol="circle"),
+            hovertemplate="%{x}<br>%{y:.0f}%<extra>cap hit</extra>",
         ))
-        fig.add_trace(go.Scatter(
-            x=ts, y=y_sub, mode="lines", name="subagents",
-            stackgroup="one", line=dict(width=0.5, color="#ff8a4f", shape="hv"),
-        ))
-    else:  # 'project share'
-        y_total = (df["cumulative_total"] * 100).to_list()
-        y_selected = (df["cumulative_selected"] * 100).to_list()
-        fig.add_trace(go.Scatter(
-            x=ts, y=y_selected, mode="lines", name="selected projects",
-            fill="tozeroy", line=dict(width=0.5, color="#4f8cff", shape="hv"),
-        ))
-        fig.add_trace(go.Scatter(
-            x=ts, y=y_total, mode="lines", name="all projects (total)",
-            line=dict(width=1.2, color="#888888", shape="hv"),
-        ))
+    fig.add_hline(y=20.0, line_dash="dash", line_color="red",
+                  annotation_text="Pro cap (est. 20%)", annotation_position="top left")
+    fig.add_hline(y=100.0, line_dash="dot", line_color="orange",
+                  annotation_text="Max 5x cap (100%)", annotation_position="top left")
+    if data_start_ts is not None and data_end_ts is not None:
+        add_calendar_bands(fig, data_start_ts, data_end_ts)
+    fig.update_layout(
+        height=350, margin=dict(t=60, b=20, l=10, r=10),
+        yaxis_title="% of Max 5x cap", yaxis_ticksuffix="%",
+        yaxis=dict(autorange=True),
+        xaxis=_rangeselector_xaxis(),
+        legend=dict(orientation="h"),
+    )
+    return fig
 
 
-def _peak_for_decomposition(df: pl.DataFrame, decomposition: str) -> float:
-    if df.is_empty():
-        return 0.0
-    if decomposition == "main vs sub":
-        return float(
-            max((m + s) for m, s in zip(
-                df["cumulative_main"].to_list(),
-                df["cumulative_sub"].to_list(),
-            ))
-        ) * 100.0
-    return float(df["cumulative_total"].max() or 0.0) * 100.0
+def render_reported_usage_chart(log: pl.DataFrame, kind: str,
+                                data_start_ts, data_end_ts) -> None:
+    title = ("5h usage limit (reported)" if kind == "5h"
+             else "Weekly usage limit (reported)")
+    st.subheader(title)
+    st.caption("Anthropic's reported utilization (Max 5x plan only). Account-wide — the "
+               "project/model filter does not affect this chart. Line breaks at each window "
+               "reset and across sampling gaps; red dots mark where you hit the cap.")
+    series, cap_hits = metrics.reported_util_series(log, kind)
+    if series.is_empty():
+        st.info("No Max-5x reported-usage samples yet.")
+        return
+    fig = build_reported_figure(series, cap_hits, kind, data_start_ts, data_end_ts)
+    st.plotly_chart(fig, width="stretch")
 
 
 def short_project(cwd: str) -> str:
@@ -128,97 +133,6 @@ def render_kpis(
     k5.metric("Peak weekly", f"{peak_weekly_share*100:.0f}%",
               help="% of Max 5x weekly cap (peak across all weeks)")
     k6.metric("Weeks over Pro", f"{weeks_over_pro} / {weeks_total}")
-
-
-def render_5h_chart(
-    five_h: pl.DataFrame, effective_5h_hours: float,
-    n_observed_resets: int, n_anchor_5h: int, effective_cap_5h: float,
-    show_max5x: bool, data_start_ts: datetime, data_end_ts: datetime,
-    decomposition_key: str,
-):
-    hours_int = int(effective_5h_hours)
-    minutes_int = int(round((effective_5h_hours - hours_int) * 60))
-    window_label = f"{hours_int}h" + (f" {minutes_int}m" if minutes_int else "")
-    calib_source = (
-        f"calibrated from {n_observed_resets} observed reset(s)"
-        if n_observed_resets >= 5
-        else f"default 4.5h (need 5 reset observations to calibrate, have {n_observed_resets})"
-    )
-    cap_label = (
-        f"calibrated from {n_anchor_5h} 100%-anchor(s), cap = {effective_cap_5h/1e6:.2f}M output tokens"
-        if n_anchor_5h > 0 else f"no anchors yet — using fallback {effective_cap_5h/1e6:.2f}M output tokens"
-    )
-    st.subheader(f"5-hour output-token burn (% of Max 5x cap, fixed window — {window_label}, {calib_source})")
-    st.caption(f"Y-axis: cumulative output tokens / cap. Cap = median across 100% anchor moments of "
-               f"(output_tokens_in_window / util). {cap_label}.")
-
-    decomposition = st.radio(
-        "Decomposition", ["project share", "main vs sub"],
-        index=0, horizontal=True, key=f"decomp_5h_{decomposition_key}",
-    )
-
-    five_h_ds = metrics.downsample_cumulative(five_h)
-    fig = go.Figure()
-    _add_cumulative_traces(fig, five_h_ds, decomposition)
-
-    y_peak = _peak_for_decomposition(five_h_ds, decomposition)
-    if 20.0 <= y_peak * 1.05:
-        fig.add_hline(y=20.0, line_dash="dash", line_color="red",
-                      annotation_text="Pro 5h cap (20%)", annotation_position="top left")
-    if show_max5x and 100.0 <= y_peak * 1.05:
-        fig.add_hline(y=100.0, line_dash="dot", line_color="orange",
-                      annotation_text="Max 5x 5h cap (100%)", annotation_position="top left")
-    add_calendar_bands(fig, data_start_ts, data_end_ts)
-    fig.update_layout(
-        height=350, margin=dict(t=60, b=20, l=10, r=10),
-        yaxis_title="% of Max 5x 5h cap", yaxis_ticksuffix="%",
-        yaxis=dict(autorange=True),
-        xaxis=_rangeselector_xaxis(),
-        legend=dict(orientation="h"),
-    )
-    st.plotly_chart(fig, width="stretch")
-
-
-def render_weekly_chart(
-    weekly: pl.DataFrame, n_anchor_week: int, effective_cap_week: float,
-    show_max5x: bool, data_start_ts: datetime, data_end_ts: datetime,
-    decomposition_key: str,
-):
-    weekday_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    reset_label = f"{weekday_names[config.WEEKLY_RESET_WEEKDAY]} {config.WEEKLY_RESET_HOUR_LOCAL:02d}:00 {config.LOCAL_TZ}"
-    cap_label_w = (
-        f"calibrated from {n_anchor_week} weekly 100%-anchor(s)" if n_anchor_week > 0
-        else f"no weekly anchors yet — using fallback {effective_cap_week/1e6:.0f}M"
-    )
-    st.subheader(f"Weekly output-token burn (% of Max 5x cap, resets {reset_label})")
-    st.caption(f"Sum of per-message output-token share-of-cap, cap = {effective_cap_week/1e6:.0f}M output "
-               f"tokens ({cap_label_w}). Monotonically non-decreasing. Sawtooth drops to 0 at each reset.")
-
-    decomposition = st.radio(
-        "Decomposition", ["project share", "main vs sub"],
-        index=0, horizontal=True, key=f"decomp_weekly_{decomposition_key}",
-    )
-
-    weekly_ds = metrics.downsample_cumulative(weekly)
-    fig = go.Figure()
-    _add_cumulative_traces(fig, weekly_ds, decomposition)
-
-    y_peak = _peak_for_decomposition(weekly_ds, decomposition)
-    if 20.0 <= y_peak * 1.05:
-        fig.add_hline(y=20.0, line_dash="dash", line_color="red",
-                      annotation_text="Pro weekly cap (20%)", annotation_position="top left")
-    if show_max5x and 100.0 <= y_peak * 1.05:
-        fig.add_hline(y=100.0, line_dash="dot", line_color="orange",
-                      annotation_text="Max 5x weekly cap (100%)", annotation_position="top left")
-    add_calendar_bands(fig, data_start_ts, data_end_ts)
-    fig.update_layout(
-        height=350, margin=dict(t=60, b=20, l=10, r=10),
-        yaxis_title="% of Max 5x weekly cap", yaxis_ticksuffix="%",
-        yaxis=dict(autorange=True),
-        xaxis=_rangeselector_xaxis(),
-        legend=dict(orientation="h"),
-    )
-    st.plotly_chart(fig, width="stretch")
 
 
 def render_daily_bar(daily: pl.DataFrame):
