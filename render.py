@@ -9,9 +9,7 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
-import app_cache
 import caps as caps_mod
-import calibration_log
 import config
 import metrics
 
@@ -184,140 +182,16 @@ def render_sessions_table(sessions_sorted: pl.DataFrame, hidden: int,
     st.dataframe(table, width="stretch", height=400)
 
 
-def render_calibration_history(df_cache: pl.DataFrame):
-    log = calibration_log.load_log()
-    if log.is_empty():
-        return
-    implied = caps_mod.implied_cap_series(log)
-    tz = ZoneInfo(config.LOCAL_TZ)
-    local_hours = [t.astimezone(tz).hour + t.astimezone(tz).minute / 60.0
-                   for t in implied["sampled_at"].to_list()]
-    implied = implied.with_columns(pl.Series("hour_local", local_hours, dtype=pl.Float64))
-
-    with st.expander("Calibration history", expanded=False):
-        col1, col2 = st.columns(2)
-        for col, key, label in [
-            (col1, "implied_5h", "Max 5x 5h cap (M)"),
-            (col2, "implied_weekly", "Max 5x weekly cap (M)"),
-        ]:
-            valid = implied.drop_nulls(key)
-            if valid.is_empty():
-                col.caption(f"No valid samples yet for {label}")
-                continue
-            median = float(valid[key].median())
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=valid["sampled_at"].to_list(),
-                y=(valid[key] / 1e6).to_list(),
-                mode="markers",
-                marker=dict(
-                    size=6,
-                    color=valid["hour_local"].to_list(),
-                    colorscale="HSV", cmin=0, cmax=24,
-                    showscale=True,
-                    colorbar=dict(title="local hr", thickness=12),
-                ),
-                customdata=valid["hour_local"].to_list(),
-                hovertemplate="%{x}<br>cap %{y:.1f}M<br>hour %{customdata:.1f}<extra></extra>",
-                name="implied cap",
-            ))
-            fig.add_hline(
-                y=median / 1e6, line_dash="dash", line_color="orange",
-                annotation_text=f"median {median/1e6:.1f}M",
-                annotation_position="top left",
-            )
-            fig.update_layout(
-                title=label, height=240,
-                margin=dict(t=40, b=20, l=10, r=10),
-                yaxis_title="M cost-weighted tokens",
-                showlegend=False,
-            )
-            col.plotly_chart(fig, width="stretch")
-
-        st.markdown("**Implied cap by hour-of-day** (local time, median ± IQR)")
-        col3, col4 = st.columns(2)
-        for col, key, label in [
-            (col3, "implied_5h", "Max 5x 5h cap by hour"),
-            (col4, "implied_weekly", "Max 5x weekly cap by hour"),
-        ]:
-            valid = implied.drop_nulls(key)
-            if valid.height < 6:
-                col.caption(f"Need ≥6 valid samples for {label} (have {valid.height})")
-                continue
-            buckets = (
-                valid.with_columns(pl.col("hour_local").floor().cast(pl.Int8).alias("hr"))
-                .group_by("hr")
-                .agg(
-                    pl.col(key).median().alias("med"),
-                    pl.col(key).quantile(0.25).alias("p25"),
-                    pl.col(key).quantile(0.75).alias("p75"),
-                    pl.col(key).count().alias("n"),
-                )
-                .sort("hr")
-            )
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=buckets["hr"].to_list(),
-                y=(buckets["p75"] / 1e6).to_list(),
-                mode="lines", line=dict(width=0, color="rgba(79,140,255,0)"),
-                showlegend=False, hoverinfo="skip",
-            ))
-            fig.add_trace(go.Scatter(
-                x=buckets["hr"].to_list(),
-                y=(buckets["p25"] / 1e6).to_list(),
-                mode="lines", line=dict(width=0, color="rgba(79,140,255,0)"),
-                fill="tonexty", fillcolor="rgba(79,140,255,0.20)",
-                name="IQR (p25–p75)", hoverinfo="skip",
-            ))
-            fig.add_trace(go.Scatter(
-                x=buckets["hr"].to_list(),
-                y=(buckets["med"] / 1e6).to_list(),
-                mode="lines+markers", line=dict(color="#4f8cff", width=2),
-                marker=dict(
-                    size=[max(6.0, 4 + n * 1.5) for n in buckets["n"].to_list()],
-                    sizemode="diameter",
-                ),
-                customdata=buckets["n"].to_list(),
-                hovertemplate="hour %{x}<br>median %{y:.1f}M<br>%{customdata} samples<extra></extra>",
-                name="raw bin median (size = samples)",
-            ))
-            kind = "5h" if key == "implied_5h" else "weekly"
-            min_burn = 1_000_000 if kind == "5h" else 10_000_000
-            fitted = caps_mod.hour_of_day_cap_series(log, kind, min_burn=min_burn)
-            fig.add_trace(go.Scatter(
-                x=list(range(24)),
-                y=[c / 1e6 for c in fitted],
-                mode="lines", line=dict(color="#ffa54f", width=1.5, dash="dot"),
-                name="fitted (smoothed + interp)",
-                hovertemplate="hour %{x}<br>fitted %{y:.1f}M<extra></extra>",
-            ))
-            ns, ne = config.NIGHT_HOURS
-            if ns > ne:
-                fig.add_vrect(x0=ns, x1=24, fillcolor="rgba(70,90,180,0.18)", line_width=0, layer="below")
-                fig.add_vrect(x0=0, x1=ne, fillcolor="rgba(70,90,180,0.18)", line_width=0, layer="below")
-            fig.update_layout(
-                title=label, height=240,
-                margin=dict(t=40, b=20, l=10, r=10),
-                xaxis=dict(title="hour of day (local)", range=[0, 24], dtick=3),
-                yaxis_title="M cost-weighted tokens",
-                showlegend=True,
-                legend=dict(orientation="h", y=-0.25),
-            )
-            col.plotly_chart(fig, width="stretch")
-
-        eff_h, n_obs = metrics.effective_window_hours(
-            log, df_cache, default=config.FIVE_HOUR_WINDOW_HOURS, min_samples=5,
-        )
-        st.caption(
-            f"Samples used per series: {int(caps_mod.CONTINUOUS_MIN_UTIL*100)}% ≤ util ≤ "
-            f"{int(caps_mod.CONTINUOUS_MAX_UTIL*100)}%. "
-            f"Total samples in log: {log.height}. "
-            f"Effective 5h window length: {eff_h:.2f}h "
-            f"({'calibrated from ' + str(n_obs) + ' observed reset(s)' if n_obs >= 5 else f'default — need 5+ resets, have {n_obs}'})."
-        )
+def format_projection(proj) -> str:
+    if proj is None or proj.eta is None:
+        return "—"
+    if not proj.before_reset:
+        return "won't hit 100% before reset"
+    mins = int(proj.eta.total_seconds() // 60)
+    return f"~{mins // 60}h {mins % 60}m"
 
 
-def render_live_panel_from_cache(*, agent_seconds_old: float | None):
+def render_live_panel_from_cache(*, agent_seconds_old: float | None, log: pl.DataFrame):
     """Cloud-only live panel: builds from caps.json instead of an API call."""
     prev = caps_mod.load_caps()
     st.subheader("Live plan usage")
@@ -355,86 +229,8 @@ def render_live_panel_from_cache(*, agent_seconds_old: float | None):
         if resets_7d:
             hours = max(0, (resets_7d - now).total_seconds() / 3600)
             cols[3].metric("7d resets in", f"{int(hours//24)}d {int(hours%24)}h")
-    if prev.max5x_5h or prev.max5x_weekly:
-        bits = []
-        if prev.max5x_5h:
-            bits.append(f"Max 5x 5h cap ≈ {prev.max5x_5h/1e6:.0f}M (Pro {prev.pro_5h/1e6:.0f}M)")
-        if prev.max5x_weekly:
-            bits.append(f"Max 5x weekly cap ≈ {prev.max5x_weekly/1e6:.0f}M (Pro {prev.pro_weekly/1e6:.0f}M)")
-        st.caption("Calibrated · " + " · ".join(bits))
+    if prev.sample_util_5h is not None:
+        proj = metrics.project_time_to_cap(log, now, "5h")
+        cols[1].caption("5h → 100%: " + format_projection(proj))
 
 
-@st.fragment
-def _cost_vs_session_length_interactive(sessions: pl.DataFrame, diag: dict) -> None:
-    """X-axis/bin controls + the two charts, isolated in a fragment.
-
-    Widget changes rerun only this block (cheap `bin_sessions` + redraw) instead of
-    the whole app — and never recompute the expensive, widget-independent attribution
-    upstream. `sessions`/`diag` come from the last full run via the captured args.
-    """
-    x_label_to_col = {
-        "Prompt tokens": "prompt_tokens",
-        "Requests (turns)": "n_requests",
-        "Raw total tokens": "raw_total_tokens",
-    }
-    ctrl_x, ctrl_bins = st.columns([2, 1])
-    x_label = ctrl_x.selectbox("X-axis", list(x_label_to_col.keys()), key="cvsl_x")
-    n_bins = ctrl_bins.slider("Bins", min_value=4, max_value=20, value=8, key="cvsl_bins")
-    x_col = x_label_to_col[x_label]
-
-    left, right = st.columns(2)
-    for col, y_col, title in (
-        (left, "attributed_pct_5h", "5h window"),
-        (right, "attributed_pct_weekly", "Weekly window"),
-    ):
-        binned = metrics.bin_sessions(sessions, x_col, y_col, n_bins)
-        fig = go.Figure()
-        if not binned.is_empty():
-            std_err = [(v * 100 if v is not None else 0.0) for v in binned["std_y"].to_list()]
-            fig.add_trace(go.Scatter(
-                x=binned["bin_median_x"].to_list(),
-                y=(binned["mean_y"] * 100).to_list(),
-                error_y=dict(type="data", array=std_err, visible=True),
-                mode="lines+markers",
-                customdata=binned["n"].to_list(),
-                hovertemplate="x=%{x:.0f}<br>mean=%{y:.2f}%<br>n=%{customdata}<extra></extra>",
-                line=dict(color="#4f8cff"),
-            ))
-        fig.update_layout(
-            title=title, height=350, margin=dict(t=40, b=20, l=10, r=10),
-            xaxis_title=x_label, yaxis_title="% of cap consumed (attributed)",
-        )
-        col.plotly_chart(fig, width="stretch", key=f"cvsl_{y_col}")
-
-    st.caption(
-        f"Unattributed burn (API % with no matching logged turn): "
-        f"5h {diag['unattributed_5h'] * 100:.1f}%, "
-        f"weekly {diag['unattributed_7d'] * 100:.1f}% (cumulative across all windows)."
-    )
-
-
-def render_cost_vs_session_length(df: pl.DataFrame, log: pl.DataFrame) -> None:
-    """Binned mean+std of each session's attributed cap-% vs session size.
-
-    df must be the derived cache (with `ts`); see the render-helper data-prep
-    convention. log is calibration_log.load_log().
-
-    Attribution (an expensive full-cache scan) is computed here, once per app run;
-    the interactive controls/charts live in a fragment so widget changes don't
-    trigger a full rerun or recompute attribution.
-    """
-    st.subheader("Cost vs session length")
-    st.caption(
-        "Each session's measured share of the cap — attributed from real API % "
-        "deltas, split by output-token share — vs how big the session was. "
-        "An upward bend means longer sessions burn disproportionately more."
-    )
-    if df.is_empty():
-        st.info("No session data yet.")
-        return
-    calib = app_cache.calibrate(df, log)
-    sessions, diag = calib.sessions, calib.diag
-    if sessions.is_empty():
-        st.info("Not enough calibration data to attribute cost yet.")
-        return
-    _cost_vs_session_length_interactive(sessions, diag)
