@@ -50,7 +50,7 @@ def _render_usage_view(
     resets_5h: datetime | None,
     util_7d: float | None,
     resets_7d: datetime | None,
-    derived: caps_mod.DerivedCaps,
+    log,
     sampled_at: datetime,
     sub_type: str,
     rate_limit_tier: str,
@@ -71,25 +71,14 @@ def _render_usage_view(
             hours = max(0, (resets_7d - now).total_seconds() / 3600)
             cols[3].metric("7d resets in", f"{int(hours//24)}d {int(hours%24)}h")
 
-    bits = []
-    if derived.max5x_5h:
-        bits.append(f"Max 5x 5h cap ≈ {derived.max5x_5h/1e6:.0f}M (Pro {derived.pro_5h/1e6:.0f}M)")
-    if derived.max5x_weekly:
-        bits.append(f"Max 5x weekly cap ≈ {derived.max5x_weekly/1e6:.0f}M (Pro {derived.pro_weekly/1e6:.0f}M)")
-
+    if util_5h is not None:
+        proj = metrics.project_time_to_cap(log, now, "5h")
+        cols[1].caption("5h → 100%: " + render.format_projection(proj))
     age_s = (now - sampled_at).total_seconds()
-    if age_s < 90:
-        age_str = f"{int(age_s)}s ago"
-    elif age_s < 5400:
-        age_str = f"{int(age_s/60)}m ago"
-    else:
-        age_str = f"{age_s/3600:.1f}h ago"
+    age_str = (f"{int(age_s)}s ago" if age_s < 90
+               else f"{int(age_s/60)}m ago" if age_s < 5400 else f"{age_s/3600:.1f}h ago")
     prefix = f"Updated {age_str}" + (" · stale (endpoint rate-limited)" if stale else "")
-
-    if bits:
-        st.caption(prefix + " · " + " · ".join(bits) + f" · sub `{sub_type}` tier `{rate_limit_tier}`")
-    else:
-        st.caption(prefix + f" · sub `{sub_type}` tier `{rate_limit_tier}`  ·  utilization too low to derive caps yet.")
+    st.caption(prefix + f" · sub `{sub_type}` tier `{rate_limit_tier}`")
 
 
 @st.fragment(run_every=300)
@@ -118,7 +107,7 @@ def live_usage_panel():
             resets_5h=resets_5h,
             util_7d=prev.sample_util_7d,
             resets_7d=resets_7d,
-            derived=prev,
+            log=calibration_log.load_log(),
             sampled_at=sampled_at,
             sub_type=prev.subscription_type or "unknown",
             rate_limit_tier=prev.rate_limit_tier or "unknown",
@@ -131,19 +120,10 @@ def live_usage_panel():
 
     # Window-aligned burns: use the actual Anthropic window the utilization refers to.
     df_all = load_data()
-    # Use effective window length if we have enough observed resets; else config default.
-    _eff_5h, _ = metrics.effective_window_hours(
-        calibration_log.load_log(), df_all,
-        default=config.FIVE_HOUR_WINDOW_HOURS, min_samples=5,
-    )
-    window_start_5h = (
-        snap.five_hour.resets_at - timedelta(hours=_eff_5h)
-        if snap.five_hour and snap.five_hour.resets_at else None
-    )
-    window_start_weekly = (
-        snap.seven_day.resets_at - timedelta(days=7)
-        if snap.seven_day and snap.seven_day.resets_at else None
-    )
+    window_start_5h = (snap.five_hour.resets_at - timedelta(hours=config.FIVE_HOUR_WINDOW_HOURS)
+                       if snap.five_hour and snap.five_hour.resets_at else None)
+    window_start_weekly = (snap.seven_day.resets_at - timedelta(days=7)
+                           if snap.seven_day and snap.seven_day.resets_at else None)
     burn_5h = calibration_log.cost_weighted_sum_in_window(df_all, window_start_5h, snap.sampled_at)
     burn_weekly = calibration_log.cost_weighted_sum_in_window(df_all, window_start_weekly, snap.sampled_at)
 
@@ -170,38 +150,16 @@ def live_usage_panel():
         "resets_7d_iso": snap.seven_day.resets_at.isoformat() if snap.seven_day and snap.seven_day.resets_at else None,
     })
 
-    # Continuous calibration: median of recent valid samples
-    snap_meta = {
-        "sampled_at": snap.sampled_at.isoformat(),
-        "sample_burn_5h": burn_5h,
-        "sample_burn_7d": burn_weekly,
-        "sample_util_5h": snap.five_hour.utilization if snap.five_hour else None,
-        "sample_util_7d": snap.seven_day.utilization if snap.seven_day else None,
-        "subscription_type": snap.subscription_type,
-        "rate_limit_tier": snap.rate_limit_tier,
-        "resets_5h_iso": snap.five_hour.resets_at.isoformat() if snap.five_hour and snap.five_hour.resets_at else None,
-        "resets_7d_iso": snap.seven_day.resets_at.isoformat() if snap.seven_day and snap.seven_day.resets_at else None,
-    }
-    log_now = calibration_log.load_log()
-    derived = caps_mod.derive_continuous_caps(log_now, snap_metadata=snap_meta)
-    # If continuous didn't yield caps yet (few valid samples), fall back to single-sample
-    if derived.max5x_5h is None or derived.max5x_weekly is None:
-        single = caps_mod.derive_from_reading(
-            burn_5h=burn_5h, util_5h=snap_meta["sample_util_5h"],
-            burn_7d=burn_weekly, util_7d=snap_meta["sample_util_7d"],
-            subscription_type=snap.subscription_type,
-            resets_5h_iso=snap_meta["resets_5h_iso"],
-            resets_7d_iso=snap_meta["resets_7d_iso"],
-            rate_limit_tier=snap.rate_limit_tier,
-        )
-        # Prefer single-sample value where continuous was None
-        if derived.max5x_5h is None and single.max5x_5h:
-            derived.max5x_5h = single.max5x_5h
-            derived.pro_5h = single.pro_5h
-        if derived.max5x_weekly is None and single.max5x_weekly:
-            derived.max5x_weekly = single.max5x_weekly
-            derived.pro_weekly = single.pro_weekly
-    caps_mod.save_caps(derived)
+    snapshot = caps_mod.DerivedCaps(
+        sampled_at=snap.sampled_at.isoformat(),
+        sample_util_5h=snap.five_hour.utilization if snap.five_hour else None,
+        sample_util_7d=snap.seven_day.utilization if snap.seven_day else None,
+        subscription_type=snap.subscription_type,
+        resets_5h_iso=snap.five_hour.resets_at.isoformat() if snap.five_hour and snap.five_hour.resets_at else None,
+        resets_7d_iso=snap.seven_day.resets_at.isoformat() if snap.seven_day and snap.seven_day.resets_at else None,
+        rate_limit_tier=snap.rate_limit_tier,
+    )
+    caps_mod.save_caps(snapshot)
 
     sb = _supabase_client()
     if sb is not None:
@@ -220,7 +178,7 @@ def live_usage_panel():
         resets_5h=snap.five_hour.resets_at if snap.five_hour else None,
         util_7d=snap.seven_day.utilization if snap.seven_day else None,
         resets_7d=snap.seven_day.resets_at if snap.seven_day else None,
-        derived=derived,
+        log=calibration_log.load_log(),
         sampled_at=snap.sampled_at,
         sub_type=snap.subscription_type,
         rate_limit_tier=snap.rate_limit_tier,
@@ -229,9 +187,6 @@ def live_usage_panel():
 
 
 live_usage_panel()
-
-
-render.render_calibration_history(load_data())
 
 
 # ---------- Sidebar ----------
@@ -265,11 +220,6 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Plan caps")
-    st.caption("Calibrated against output tokens — Anthropic's actual rate-limit signal.")
-    show_max5x = st.checkbox("Show Max 5x line too", value=True)
-
-    st.divider()
     st.subheader("Session table filter")
     min_turns = st.number_input("Min main turns", min_value=1, max_value=100, value=5, step=1)
     min_duration_s = st.number_input("Min duration (seconds)", min_value=0, max_value=3600, value=60, step=10)
@@ -299,80 +249,27 @@ data_start_ts = df["ts"].min()
 data_end_ts = df["ts"].max()
 
 
-# ---------- Single global cap derived from 100% anchors ----------
-calib_log_global = calibration_log.load_log()
-calib = app_cache.calibrate(df, calib_log_global)
-effective_5h_hours = calib.eff_hours
-n_observed_resets = calib.n_observed
+log = calibration_log.load_log()
 
-# Caps are calibrated against output tokens (Anthropic's actual metering signal).
-# Fallback uses a rough heuristic: Max 5x output cap ≈ 2.1M tokens/5h, weekly ≈ 100M.
-OUTPUT_CAP_5H_FALLBACK = 2_100_000.0
-OUTPUT_CAP_WEEKLY_FALLBACK = 100_000_000.0
-global_cap_5h = calib.cap_5h
-n_anchor_5h = calib.n_anchor_5h
-global_cap_week = calib.cap_weekly
-n_anchor_week = calib.n_anchor_weekly
-effective_cap_5h = global_cap_5h if global_cap_5h else OUTPUT_CAP_5H_FALLBACK
-effective_cap_week = global_cap_week if global_cap_week else OUTPUT_CAP_WEEKLY_FALLBACK
-
-df_with_caps = df_with_mask.with_columns(
-    (pl.col("output_tokens") / effective_cap_5h).alias("share_5h"),
-    (pl.col("output_tokens") / effective_cap_week).alias("share_week"),
-)
-
-
-# ---------- KPIs ----------
-# Lifetime KPIs (over full df, not project-filtered — represents true cap usage)
-total_cw = float(df["cost_weighted_tokens"].sum())
-
-fc = app_cache.filtered_compute(
-    df_with_caps, fdf, selected_projects, selected_models,
-    effective_5h_hours, effective_cap_5h, effective_cap_week,
-)
-sessions = fc.sessions
-five_h = fc.five_h
-weekly = fc.weekly
-five_h_window_shares = fc.five_h_window_shares
-per_week_shares = fc.per_week_shares
-daily = fc.daily
-
-peak_5h_share = float(five_h["cumulative_total"].max() or 0)
-peak_weekly_share = float(weekly["cumulative_total"].max() or 0)
-
+# ---- KPIs ----
+total_usd = float(df["dollar_cost"].sum())
 span_days = max((df["ts"].max() - df["ts"].min()).total_seconds() / 86400.0, 1.0)
-daily_avg = total_cw / span_days
+daily_avg_usd = total_usd / span_days
+peak_5h = metrics.peak_reported(log, "5h")
+peak_weekly = metrics.peak_reported(log, "weekly")
+w5_over, w5_total = metrics.windows_over_threshold(log, "5h", 0.20)
+wk_over, wk_total = metrics.windows_over_threshold(log, "weekly", 0.20)
+render.render_kpis(total_usd, daily_avg_usd, peak_5h, peak_weekly,
+                   w5_over, w5_total, wk_over, wk_total)
 
-windows_over_pro_5h = sum(1 for s in five_h_window_shares if s > 0.20)
-windows_total_5h = len(five_h_window_shares)
+# ---- Charts ----
+render.render_reported_usage_chart(log, "5h", data_start_ts, data_end_ts)
+render.render_reported_usage_chart(log, "weekly", data_start_ts, data_end_ts)
+render.render_daily_bar(fdf, decomposition_key="app")
 
-weeks_over_pro = per_week_shares.filter(pl.col("week_share") > 0.20).height
-weeks_total = per_week_shares.height
-
-render.render_kpis(total_cw, daily_avg, peak_5h_share, peak_weekly_share,
-                   windows_over_pro_5h, windows_total_5h, weeks_over_pro, weeks_total)
-
-
-# ---------- Chart 1: 5h fixed window ----------
-render.render_5h_chart(
-    five_h, effective_5h_hours, n_observed_resets, n_anchor_5h,
-    effective_cap_5h, show_max5x, data_start_ts, data_end_ts,
-    decomposition_key="app",
-)
-
-# ---------- Chart 2: Weekly cumulative (fixed reset) ----------
-render.render_weekly_chart(
-    weekly, n_anchor_week, effective_cap_week,
-    show_max5x, data_start_ts, data_end_ts,
-    decomposition_key="app",
-)
-
-# ---------- Chart 3: Daily stacked ----------
-render.render_daily_bar(daily)
-
-
-# ---------- Chart 4: Cost vs session length ----------
-render.render_cost_vs_session_length(df, calib_log_global)
+# ---- Session table ----
+fc = app_cache.filtered_compute(fdf)
+sessions = fc.sessions
 
 
 # ---------- Session aggregation for summary table ----------
