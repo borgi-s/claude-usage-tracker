@@ -52,7 +52,7 @@ def add_derived(df: pl.DataFrame) -> pl.DataFrame:
     if df.is_empty():
         return df
     w = config.COST_WEIGHTS
-    return (
+    priced = (
         df.with_columns(
             pl.col("timestamp")
             .str.strptime(pl.Datetime("ms", "UTC"), format="%Y-%m-%dT%H:%M:%S%.fZ", strict=False)
@@ -79,6 +79,31 @@ def add_derived(df: pl.DataFrame) -> pl.DataFrame:
         )
         .filter(pl.col("ts").is_not_null())
         .sort("ts")
+    )
+    # Per-model USD: build a small (model -> prices) frame and join (avoids a
+    # row-wise python call). price_for handles unknown models + warns.
+    models = [m for m in priced["model"].unique().to_list()]
+    price_rows = []
+    for m in models:
+        p = config.price_for(m)
+        price_rows.append({"model": m, "_p_in": p["input"], "_p_out": p["output"],
+                           "_p_cw": p["cache_write"], "_p_cr": p["cache_read"]})
+    price_df = pl.DataFrame(price_rows) if price_rows else pl.DataFrame(
+        schema={"model": pl.Utf8, "_p_in": pl.Float64, "_p_out": pl.Float64,
+                "_p_cw": pl.Float64, "_p_cr": pl.Float64})
+    return (
+        priced.join(price_df, on="model", how="left")
+        .with_columns(
+            (
+                (
+                    pl.col("input_tokens") * pl.col("_p_in")
+                    + pl.col("output_tokens") * pl.col("_p_out")
+                    + pl.col("cache_creation_input_tokens") * pl.col("_p_cw")
+                    + pl.col("cache_read_input_tokens") * pl.col("_p_cr")
+                ) / 1_000_000.0
+            ).alias("dollar_cost")
+        )
+        .drop(["_p_in", "_p_out", "_p_cw", "_p_cr"])
     )
 
 
