@@ -33,13 +33,6 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 DEFAULT_CONTEXT_WINDOW = 200_000
 
 
-PRO_CAP_5H_COST_WEIGHTED = 30_000_000
-PRO_CAP_WEEKLY_COST_WEIGHTED = 140_000_000
-
-MAX5X_CAP_5H_COST_WEIGHTED = PRO_CAP_5H_COST_WEIGHTED * 5
-MAX5X_CAP_WEEKLY_COST_WEIGHTED = PRO_CAP_WEEKLY_COST_WEIGHTED * 5
-
-
 CAP_DISCLAIMER = (
     "Caps are community-derived estimates. Anthropic does not publish exact "
     "token quotas for subscription plans. Edit config.py to recalibrate."
