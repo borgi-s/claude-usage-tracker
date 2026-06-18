@@ -14,3 +14,7 @@ def test_format_after_reset():
 def test_format_eta():
     s = render.format_projection(CapProjection(timedelta(hours=1, minutes=20), True))
     assert "1h" in s and "20m" in s
+
+
+def test_format_at_cap():
+    assert render.format_projection(CapProjection(timedelta(0), True)) == "at/over the cap now"

@@ -41,7 +41,7 @@ def refresh_and_reload():
 
 
 st.title("Claude usage tracker")
-st.caption(config.CAP_DISCLAIMER)
+st.caption("Live local view · reported 5h/weekly utilization from Anthropic's usage API · daily burn in API-equivalent USD.")
 
 
 def _render_usage_view(

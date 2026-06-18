@@ -85,7 +85,7 @@ def _parse_reset(s):
     return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
-def _window_ids(ts_list, reset_list, kind: str) -> list[int]:
+def _window_ids(reset_list, kind: str) -> list[int]:
     """Jitter-tolerant integer window id per sample. New id when the parsed reset
     time jumps forward by more than the kind's tolerance (resets jitter by seconds;
     a real reset jumps ~5h / ~7d)."""
@@ -135,7 +135,7 @@ def project_time_to_cap(log: pl.DataFrame, now: datetime, kind: str = "5h") -> C
     if mx.height < 2:
         return CapProjection(None, True)
     reset_list = mx[reset_col].to_list() if reset_col in mx.columns else [None] * mx.height
-    wids = _window_ids(mx["sampled_at"].to_list(), reset_list, kind)
+    wids = _window_ids(reset_list, kind)
     last_wid = wids[-1]
     cur = [(t, u, r) for t, u, r, w in
            zip(mx["sampled_at"].to_list(), mx[util_col].to_list(), reset_list, wids)
@@ -226,7 +226,7 @@ def windows_over_threshold(log: pl.DataFrame, kind: str, threshold: float) -> tu
     if mx.is_empty():
         return 0, 0
     reset_list = mx[reset_col].to_list() if reset_col in mx.columns else [None] * mx.height
-    wids = _window_ids(mx["sampled_at"].to_list(), reset_list, kind)
+    wids = _window_ids(reset_list, kind)
     grouped = (
         mx.with_columns(pl.Series("_wid", wids))
         .group_by("_wid")

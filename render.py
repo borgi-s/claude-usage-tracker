@@ -187,6 +187,8 @@ def format_projection(proj) -> str:
         return "—"
     if not proj.before_reset:
         return "won't hit 100% before reset"
+    if proj.eta.total_seconds() <= 0:
+        return "at/over the cap now"
     mins = int(proj.eta.total_seconds() // 60)
     return f"~{mins // 60}h {mins % 60}m"
 

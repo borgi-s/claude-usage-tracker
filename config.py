@@ -33,12 +33,6 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 DEFAULT_CONTEXT_WINDOW = 200_000
 
 
-CAP_DISCLAIMER = (
-    "Caps are community-derived estimates. Anthropic does not publish exact "
-    "token quotas for subscription plans. Edit config.py to recalibrate."
-)
-
-
 CONTEXT_THRESHOLDS = {"green_max": 0.25, "yellow_max": 0.50}
 ABSOLUTE_CONTEXT_REFERENCE = 200_000
 
